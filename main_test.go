@@ -7,9 +7,13 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -270,8 +274,193 @@ func TestParseLiteral(t *testing.T) {
 	}
 }
 
-// ── Integration test with mock IMAP server ──
+func TestShouldStripCaps(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config
+		want bool
+	}{
+		{"no client TLS strips caps", config{}, true},
+		{"client TLS does not strip", config{clientTLSCert: "/some/cert.pem", clientTLSKey: "/some/key.pem"}, false},
+		{"only cert set strips caps", config{clientTLSCert: "/some/cert.pem"}, true},
+		{"only key set strips caps", config{clientTLSKey: "/some/key.pem"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.shouldStripCaps()
+			if got != tt.want {
+				t.Errorf("shouldStripCaps() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
+func TestParseConfigValidation(t *testing.T) {
+	// Save and restore env vars
+	envVars := []string{
+		"IMAP_GUARD_LISTEN", "IMAP_GUARD_UPSTREAM",
+		"IMAP_GUARD_UPSTREAM_TLS", "IMAP_GUARD_UPSTREAM_VERIFY",
+		"IMAP_GUARD_CLIENT_TLS_CERT", "IMAP_GUARD_CLIENT_TLS_KEY",
+	}
+	saved := make(map[string]string)
+	for _, k := range envVars {
+		saved[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for k, v := range saved {
+			if v == "" {
+				os.Unsetenv(k)
+			} else {
+				os.Setenv(k, v)
+			}
+		}
+	})
+	clearEnv := func() {
+		for _, k := range envVars {
+			os.Unsetenv(k)
+		}
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		clearEnv()
+		cfg, err := parseConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.listenAddr != ":1143" {
+			t.Errorf("listenAddr = %q, want :1143", cfg.listenAddr)
+		}
+		if cfg.upstreamAddr != "127.0.0.1:143" {
+			t.Errorf("upstreamAddr = %q, want 127.0.0.1:143", cfg.upstreamAddr)
+		}
+		if cfg.upstreamTLS != upstreamSTARTTLS {
+			t.Errorf("upstreamTLS = %d, want upstreamSTARTTLS", cfg.upstreamTLS)
+		}
+		if cfg.upstreamVerify != "verify" {
+			t.Errorf("upstreamVerify = %q, want verify", cfg.upstreamVerify)
+		}
+	})
+
+	t.Run("invalid TLS mode", func(t *testing.T) {
+		clearEnv()
+		os.Setenv("IMAP_GUARD_UPSTREAM_TLS", "invalid")
+		_, err := parseConfig()
+		if err == nil {
+			t.Fatal("expected error for invalid TLS mode")
+		}
+		if !strings.Contains(err.Error(), "invalid") {
+			t.Errorf("error should mention 'invalid', got: %v", err)
+		}
+	})
+
+	t.Run("skip verify with plaintext", func(t *testing.T) {
+		clearEnv()
+		os.Setenv("IMAP_GUARD_UPSTREAM_TLS", "plaintext")
+		os.Setenv("IMAP_GUARD_UPSTREAM_VERIFY", "skip")
+		_, err := parseConfig()
+		if err == nil {
+			t.Fatal("expected error for skip+plaintext")
+		}
+		if !strings.Contains(err.Error(), "no TLS to verify") {
+			t.Errorf("error should mention no TLS, got: %v", err)
+		}
+	})
+
+	t.Run("CA file with plaintext", func(t *testing.T) {
+		clearEnv()
+		os.Setenv("IMAP_GUARD_UPSTREAM_TLS", "plaintext")
+		os.Setenv("IMAP_GUARD_UPSTREAM_VERIFY", "/some/ca.pem")
+		_, err := parseConfig()
+		if err == nil {
+			t.Fatal("expected error for CA file+plaintext")
+		}
+	})
+
+	t.Run("cert without key", func(t *testing.T) {
+		clearEnv()
+		tmpDir := t.TempDir()
+		certFile := filepath.Join(tmpDir, "cert.pem")
+		os.WriteFile(certFile, []byte("dummy"), 0o600)
+		os.Setenv("IMAP_GUARD_CLIENT_TLS_CERT", certFile)
+		_, err := parseConfig()
+		if err == nil {
+			t.Fatal("expected error for cert without key")
+		}
+		if !strings.Contains(err.Error(), "both be set") {
+			t.Errorf("error should mention both, got: %v", err)
+		}
+	})
+
+	t.Run("key without cert", func(t *testing.T) {
+		clearEnv()
+		tmpDir := t.TempDir()
+		keyFile := filepath.Join(tmpDir, "key.pem")
+		os.WriteFile(keyFile, []byte("dummy"), 0o600)
+		os.Setenv("IMAP_GUARD_CLIENT_TLS_KEY", keyFile)
+		_, err := parseConfig()
+		if err == nil {
+			t.Fatal("expected error for key without cert")
+		}
+	})
+
+	t.Run("nonexistent CA file", func(t *testing.T) {
+		clearEnv()
+		os.Setenv("IMAP_GUARD_UPSTREAM_VERIFY", "/nonexistent/ca.pem")
+		_, err := parseConfig()
+		if err == nil {
+			t.Fatal("expected error for nonexistent CA file")
+		}
+	})
+
+	t.Run("nonexistent cert file", func(t *testing.T) {
+		clearEnv()
+		tmpDir := t.TempDir()
+		keyFile := filepath.Join(tmpDir, "key.pem")
+		os.WriteFile(keyFile, []byte("dummy"), 0o600)
+		os.Setenv("IMAP_GUARD_CLIENT_TLS_CERT", "/nonexistent/cert.pem")
+		os.Setenv("IMAP_GUARD_CLIENT_TLS_KEY", keyFile)
+		_, err := parseConfig()
+		if err == nil {
+			t.Fatal("expected error for nonexistent cert file")
+		}
+	})
+
+	t.Run("plaintext mode", func(t *testing.T) {
+		clearEnv()
+		os.Setenv("IMAP_GUARD_UPSTREAM_TLS", "plaintext")
+		cfg, err := parseConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.upstreamTLS != upstreamPlaintext {
+			t.Errorf("upstreamTLS = %d, want upstreamPlaintext", cfg.upstreamTLS)
+		}
+	})
+
+	t.Run("tls mode", func(t *testing.T) {
+		clearEnv()
+		os.Setenv("IMAP_GUARD_UPSTREAM_TLS", "tls")
+		cfg, err := parseConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.upstreamTLS != upstreamImplicitTLS {
+			t.Errorf("upstreamTLS = %d, want upstreamImplicitTLS", cfg.upstreamTLS)
+		}
+	})
+}
+
+// ── Test helpers ──
+
+type mockUpstreamMode int
+
+const (
+	mockSTARTTLS  mockUpstreamMode = iota
+	mockPlaintext
+	mockImplicitTLS
+)
+
+// generateTestCert generates a self-signed TLS certificate for testing.
 func generateTestCert(t *testing.T) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -295,25 +484,165 @@ func generateTestCert(t *testing.T) tls.Certificate {
 	}
 }
 
-// mockUpstream simulates an upstream IMAP server with STARTTLS support.
-// It records commands it receives and responds appropriately.
+// generateTestCA creates a CA key pair and returns the CA cert, CA tls.Certificate, and a
+// function to sign server certs. Also writes the CA PEM to a temp file and returns its path.
+func generateTestCA(t *testing.T) (caCert *x509.Certificate, caKeyPair tls.Certificate, caFile string) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test CA"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	caCertDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	caCert, _ = x509.ParseCertificate(caCertDER)
+
+	// Write CA cert PEM to temp file
+	tmpDir := t.TempDir()
+	caFile = filepath.Join(tmpDir, "ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatalf("write CA file: %v", err)
+	}
+
+	caKeyPair = tls.Certificate{
+		Certificate: [][]byte{caCertDER},
+		PrivateKey:  caKey,
+	}
+	return caCert, caKeyPair, caFile
+}
+
+// signServerCert creates a server certificate signed by the given CA.
+func signServerCert(t *testing.T, caCert *x509.Certificate, caKey *ecdsa.PrivateKey) tls.Certificate {
+	t.Helper()
+	serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate server key: %v", err)
+	}
+	serverTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	serverCertDER, err := x509.CreateCertificate(rand.Reader, serverTmpl, caCert, &serverKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{serverCertDER},
+		PrivateKey:  serverKey,
+	}
+}
+
+// writeTempCertKey writes a TLS certificate and key as PEM files in a temp directory.
+func writeTempCertKey(t *testing.T, cert tls.Certificate) (certFile, keyFile string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	certFile = filepath.Join(tmpDir, "cert.pem")
+	keyFile = filepath.Join(tmpDir, "key.pem")
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+
+	ecKey, ok := cert.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok {
+		t.Fatal("expected ECDSA key")
+	}
+	keyDER, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	return certFile, keyFile
+}
+
+// testConfig returns a config suitable for tests, defaulting to STARTTLS with skip verify.
+func testConfig(upstreamAddr string) *config {
+	return &config{
+		upstreamAddr:   upstreamAddr,
+		upstreamTLS:    upstreamSTARTTLS,
+		upstreamVerify: "skip",
+	}
+}
+
+// mockUpstream simulates an upstream IMAP server supporting different connection modes.
 type mockUpstream struct {
 	listener net.Listener
 	received []string
 	errors   []string
 	mu       sync.Mutex
 	cert     tls.Certificate
+	mode     mockUpstreamMode
 }
 
-func newMockUpstream(t *testing.T) *mockUpstream {
+func newMockUpstream(t *testing.T, mode mockUpstreamMode) *mockUpstream {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+
+	cert := generateTestCert(t)
+
+	var ln net.Listener
+	var err error
+	switch mode {
+	case mockImplicitTLS:
+		ln, err = tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		})
+	default:
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+	}
 	if err != nil {
 		t.Fatalf("mock upstream listen: %v", err)
 	}
+
 	return &mockUpstream{
 		listener: ln,
-		cert:     generateTestCert(t),
+		cert:     cert,
+		mode:     mode,
+	}
+}
+
+// newMockUpstreamWithCert creates a mock upstream using a specific TLS certificate.
+func newMockUpstreamWithCert(t *testing.T, mode mockUpstreamMode, cert tls.Certificate) *mockUpstream {
+	t.Helper()
+
+	var ln net.Listener
+	var err error
+	switch mode {
+	case mockImplicitTLS:
+		ln, err = tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		})
+	default:
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+	}
+	if err != nil {
+		t.Fatalf("mock upstream listen: %v", err)
+	}
+
+	return &mockUpstream{
+		listener: ln,
+		cert:     cert,
+		mode:     mode,
 	}
 }
 
@@ -362,6 +691,23 @@ func (m *mockUpstream) serve() {
 func (m *mockUpstream) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	switch m.mode {
+	case mockPlaintext:
+		m.handlePlaintextConn(conn)
+	case mockSTARTTLS:
+		m.handleSTARTTLSConn(conn)
+	case mockImplicitTLS:
+		// Connection is already TLS from tls.Listen
+		m.handlePlaintextConn(conn) // same command loop, just over TLS
+	}
+}
+
+func (m *mockUpstream) handlePlaintextConn(conn net.Conn) {
+	fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN] Mock server ready\r\n")
+	m.handleIMAPCommands(conn)
+}
+
+func (m *mockUpstream) handleSTARTTLSConn(conn net.Conn) {
 	fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED IDLE AUTH=PLAIN] Mock server ready\r\n")
 
 	reader := bufio.NewReader(conn)
@@ -388,9 +734,11 @@ func (m *mockUpstream) handleConn(conn net.Conn) {
 	}
 	defer tlsConn.Close()
 
-	reader = bufio.NewReader(tlsConn)
+	m.handleIMAPCommands(tlsConn)
+}
 
-	// Handle IMAP commands post-STARTTLS
+func (m *mockUpstream) handleIMAPCommands(conn net.Conn) {
+	reader := bufio.NewReader(conn)
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -408,49 +756,51 @@ func (m *mockUpstream) handleConn(conn net.Conn) {
 
 		switch cmd {
 		case "LOGIN":
-			fmt.Fprintf(tlsConn, "%s OK [CAPABILITY IMAP4rev1 IDLE MOVE AUTH=PLAIN] LOGIN completed\r\n", tag)
+			fmt.Fprintf(conn, "%s OK [CAPABILITY IMAP4rev1 IDLE MOVE AUTH=PLAIN] LOGIN completed\r\n", tag)
 		case "SELECT", "EXAMINE":
 			mailbox := ""
 			if len(parts) > 2 {
 				mailbox = strings.Trim(parts[2], "\"")
 			}
-			fmt.Fprintf(tlsConn, "* 10 EXISTS\r\n")
-			fmt.Fprintf(tlsConn, "* 0 RECENT\r\n")
-			fmt.Fprintf(tlsConn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
-			fmt.Fprintf(tlsConn, "%s OK [READ-WRITE] %s selected\r\n", tag, mailbox)
+			fmt.Fprintf(conn, "* 10 EXISTS\r\n")
+			fmt.Fprintf(conn, "* 0 RECENT\r\n")
+			fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+			fmt.Fprintf(conn, "%s OK [READ-WRITE] %s selected\r\n", tag, mailbox)
 		case "STORE":
-			fmt.Fprintf(tlsConn, "%s OK STORE completed\r\n", tag)
+			fmt.Fprintf(conn, "%s OK STORE completed\r\n", tag)
 		case "EXPUNGE":
-			fmt.Fprintf(tlsConn, "%s OK EXPUNGE completed\r\n", tag)
+			fmt.Fprintf(conn, "%s OK EXPUNGE completed\r\n", tag)
 		case "MOVE":
-			fmt.Fprintf(tlsConn, "%s OK MOVE completed\r\n", tag)
+			fmt.Fprintf(conn, "%s OK MOVE completed\r\n", tag)
 		case "UID":
 			if len(parts) > 2 {
 				subParts := strings.SplitN(parts[2], " ", 2)
 				subCmd := strings.ToUpper(subParts[0])
-				fmt.Fprintf(tlsConn, "%s OK UID %s completed\r\n", tag, subCmd)
+				fmt.Fprintf(conn, "%s OK UID %s completed\r\n", tag, subCmd)
 			} else {
-				fmt.Fprintf(tlsConn, "%s OK UID completed\r\n", tag)
+				fmt.Fprintf(conn, "%s OK UID completed\r\n", tag)
 			}
 		case "LOGOUT":
-			fmt.Fprintf(tlsConn, "* BYE logging out\r\n")
-			fmt.Fprintf(tlsConn, "%s OK LOGOUT completed\r\n", tag)
+			fmt.Fprintf(conn, "* BYE logging out\r\n")
+			fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
 			return
 		case "NOOP":
-			fmt.Fprintf(tlsConn, "%s OK NOOP completed\r\n", tag)
+			fmt.Fprintf(conn, "%s OK NOOP completed\r\n", tag)
 		default:
-			fmt.Fprintf(tlsConn, "%s OK %s completed\r\n", tag, cmd)
+			fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, cmd)
 		}
 	}
 }
 
+// ── Integration tests ──
+
 func TestProxyEndToEnd(t *testing.T) {
-	// Start mock upstream
-	upstream := newMockUpstream(t)
+	upstream := newMockUpstream(t, mockSTARTTLS)
 	defer upstream.listener.Close()
 	go upstream.serve()
 
-	// Start imap-guard proxy pointing at mock upstream
+	cfg := testConfig(upstream.addr())
+
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
@@ -463,11 +813,10 @@ func TestProxyEndToEnd(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleClient(conn, upstream.addr(), "test")
+			go handleClient(conn, cfg, "test")
 		}
 	}()
 
-	// Helper to connect a test client
 	connect := func(t *testing.T) (*bufio.Reader, net.Conn) {
 		t.Helper()
 		conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
@@ -475,12 +824,10 @@ func TestProxyEndToEnd(t *testing.T) {
 			t.Fatalf("client connect: %v", err)
 		}
 		reader := bufio.NewReader(conn)
-		// Read greeting
 		greeting, err := reader.ReadString('\n')
 		if err != nil {
 			t.Fatalf("read greeting: %v", err)
 		}
-		// Verify STARTTLS and LOGINDISABLED stripped
 		if strings.Contains(strings.ToUpper(greeting), "STARTTLS") {
 			t.Errorf("greeting still contains STARTTLS: %s", greeting)
 		}
@@ -496,7 +843,6 @@ func TestProxyEndToEnd(t *testing.T) {
 	sendAndRead := func(t *testing.T, reader *bufio.Reader, conn net.Conn, cmd string) string {
 		t.Helper()
 		fmt.Fprintf(conn, "%s\r\n", cmd)
-		// Read all response lines until we see the tag
 		tag := strings.SplitN(cmd, " ", 2)[0]
 		var resp strings.Builder
 		for {
@@ -505,7 +851,6 @@ func TestProxyEndToEnd(t *testing.T) {
 				t.Fatalf("read response for %q: %v", cmd, err)
 			}
 			resp.WriteString(line)
-			// Check if this is the tagged response
 			if strings.HasPrefix(line, tag+" ") {
 				break
 			}
@@ -667,21 +1012,18 @@ func TestProxyEndToEnd(t *testing.T) {
 		defer conn.Close()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
-		// Start in Trash — blocked
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		resp := sendAndRead(t, reader, conn, "a3 EXPUNGE")
 		if !strings.Contains(resp, "a3 NO") {
 			t.Errorf("EXPUNGE in Trash should be blocked, got: %s", resp)
 		}
 
-		// Switch to INBOX — allowed
 		sendAndRead(t, reader, conn, "a4 SELECT INBOX")
 		resp = sendAndRead(t, reader, conn, "a5 EXPUNGE")
 		if !strings.Contains(resp, "a5 OK") {
 			t.Errorf("EXPUNGE in INBOX should be allowed, got: %s", resp)
 		}
 
-		// Switch back to Drafts — blocked again
 		sendAndRead(t, reader, conn, "a6 SELECT Drafts")
 		resp = sendAndRead(t, reader, conn, "a7 EXPUNGE")
 		if !strings.Contains(resp, "a7 NO") {
@@ -690,7 +1032,6 @@ func TestProxyEndToEnd(t *testing.T) {
 	})
 
 	t.Run("blocked_commands_not_forwarded_to_upstream", func(t *testing.T) {
-		// Reset received
 		upstream.mu.Lock()
 		upstream.received = nil
 		upstream.mu.Unlock()
@@ -699,11 +1040,9 @@ func TestProxyEndToEnd(t *testing.T) {
 		defer conn.Close()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
-		sendAndRead(t, reader, conn, "a3 EXPUNGE")        // blocked
-		sendAndRead(t, reader, conn, "a4 STORE 1 +FLAGS (\\Deleted)") // blocked
-		sendAndRead(t, reader, conn, "a5 NOOP")            // allowed
-		// Use LOGOUT as a synchronization barrier — once we get the response,
-		// all prior commands have been processed by the upstream
+		sendAndRead(t, reader, conn, "a3 EXPUNGE")
+		sendAndRead(t, reader, conn, "a4 STORE 1 +FLAGS (\\Deleted)")
+		sendAndRead(t, reader, conn, "a5 NOOP")
 		sendAndRead(t, reader, conn, "a6 LOGOUT")
 
 		received := upstream.getReceived()
@@ -716,7 +1055,6 @@ func TestProxyEndToEnd(t *testing.T) {
 			}
 		}
 
-		// Verify NOOP was forwarded
 		found := false
 		for _, cmd := range received {
 			if strings.HasPrefix(cmd, "a5") && strings.Contains(strings.ToUpper(cmd), "NOOP") {
@@ -732,12 +1070,9 @@ func TestProxyEndToEnd(t *testing.T) {
 		reader, conn := connect(t)
 		defer conn.Close()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
-		// Send SELECT with literal mailbox name: {5}\r\nTrash
 		fmt.Fprintf(conn, "a2 SELECT {5}\r\n")
-		// Small delay to let the proxy read the command line
 		time.Sleep(10 * time.Millisecond)
 		fmt.Fprintf(conn, "Trash")
-		// Read the SELECT response
 		tag := "a2"
 		var resp strings.Builder
 		for {
@@ -750,7 +1085,6 @@ func TestProxyEndToEnd(t *testing.T) {
 				break
 			}
 		}
-		// Now try to EXPUNGE — should be blocked because proxy parsed the literal mailbox name
 		resp2 := sendAndRead(t, reader, conn, "a3 EXPUNGE")
 		if !strings.Contains(resp2, "a3 NO") {
 			t.Errorf("EXPUNGE after literal SELECT Trash should be blocked, got: %s", resp2)
@@ -767,4 +1101,260 @@ func TestProxyEndToEnd(t *testing.T) {
 			t.Errorf("EXPUNGE in quoted \"Trash\" should be blocked, got: %s", resp)
 		}
 	})
+}
+
+func TestProxyPlaintextUpstream(t *testing.T) {
+	upstream := newMockUpstream(t, mockPlaintext)
+	defer upstream.listener.Close()
+	go upstream.serve()
+
+	cfg := &config{
+		upstreamAddr:   upstream.addr(),
+		upstreamTLS:    upstreamPlaintext,
+		upstreamVerify: "verify",
+	}
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	defer proxyLn.Close()
+
+	go func() {
+		for {
+			conn, err := proxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleClient(conn, cfg, "test")
+		}
+	}()
+
+	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
+	if !strings.Contains(greeting, "IMAP4rev1") {
+		t.Errorf("greeting missing IMAP4rev1: %s", greeting)
+	}
+
+	// Send login and verify relay works
+	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	tag := "a1"
+	var resp strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		resp.WriteString(line)
+		if strings.HasPrefix(line, tag+" ") {
+			break
+		}
+	}
+	if !strings.Contains(resp.String(), "a1 OK") {
+		t.Errorf("LOGIN should succeed over plaintext, got: %s", resp.String())
+	}
+}
+
+func TestProxyImplicitTLSUpstream(t *testing.T) {
+	upstream := newMockUpstream(t, mockImplicitTLS)
+	defer upstream.listener.Close()
+	go upstream.serve()
+
+	cfg := &config{
+		upstreamAddr:   upstream.addr(),
+		upstreamTLS:    upstreamImplicitTLS,
+		upstreamVerify: "skip",
+	}
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	defer proxyLn.Close()
+
+	go func() {
+		for {
+			conn, err := proxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleClient(conn, cfg, "test")
+		}
+	}()
+
+	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
+	if !strings.Contains(greeting, "IMAP4rev1") {
+		t.Errorf("greeting missing IMAP4rev1: %s", greeting)
+	}
+
+	// Verify relay works through implicit TLS
+	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	tag := "a1"
+	var resp strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		resp.WriteString(line)
+		if strings.HasPrefix(line, tag+" ") {
+			break
+		}
+	}
+	if !strings.Contains(resp.String(), "a1 OK") {
+		t.Errorf("LOGIN should succeed over implicit TLS, got: %s", resp.String())
+	}
+}
+
+func TestProxyClientTLS(t *testing.T) {
+	upstream := newMockUpstream(t, mockSTARTTLS)
+	defer upstream.listener.Close()
+	go upstream.serve()
+
+	clientCert := generateTestCert(t)
+	certFile, keyFile := writeTempCertKey(t, clientCert)
+
+	cfg := &config{
+		upstreamAddr:   upstream.addr(),
+		upstreamTLS:    upstreamSTARTTLS,
+		upstreamVerify: "skip",
+		clientTLSCert:  certFile,
+		clientTLSKey:   keyFile,
+	}
+
+	// Start TLS proxy listener
+	proxyCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("load proxy cert: %v", err)
+	}
+	proxyLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{proxyCert},
+	})
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	defer proxyLn.Close()
+
+	go func() {
+		for {
+			conn, err := proxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleClient(conn, cfg, "test")
+		}
+	}()
+
+	// Connect client with TLS
+	conn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 5 * time.Second},
+		"tcp",
+		proxyLn.Addr().String(),
+		&tls.Config{InsecureSkipVerify: true},
+	)
+	if err != nil {
+		t.Fatalf("client TLS connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
+
+	// When client TLS is enabled, STARTTLS should NOT be stripped
+	// The upstream greeting has STARTTLS in it; with client TLS enabled, it passes through
+	if !strings.Contains(greeting, "IMAP4rev1") {
+		t.Errorf("greeting missing IMAP4rev1: %s", greeting)
+	}
+	// The key check: shouldStripCaps() returns false when client TLS is configured,
+	// so STARTTLS/LOGINDISABLED from the upstream greeting should be preserved
+	if !strings.Contains(strings.ToUpper(greeting), "STARTTLS") {
+		t.Errorf("with client TLS, STARTTLS should NOT be stripped from greeting: %s", greeting)
+	}
+}
+
+func TestCAFileVerification(t *testing.T) {
+	caCertParsed, caKeyPair, caFilePath := generateTestCA(t)
+	caPrivKey := caKeyPair.PrivateKey.(*ecdsa.PrivateKey)
+
+	serverCert := signServerCert(t, caCertParsed, caPrivKey)
+	upstream := newMockUpstreamWithCert(t, mockImplicitTLS, serverCert)
+	defer upstream.listener.Close()
+	go upstream.serve()
+
+	cfg := &config{
+		upstreamAddr:   upstream.addr(),
+		upstreamTLS:    upstreamImplicitTLS,
+		upstreamVerify: caFilePath,
+	}
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	defer proxyLn.Close()
+
+	go func() {
+		for {
+			conn, err := proxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleClient(conn, cfg, "test")
+		}
+	}()
+
+	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
+	if !strings.Contains(greeting, "IMAP4rev1") {
+		t.Errorf("greeting missing IMAP4rev1: %s", greeting)
+	}
+
+	// Verify relay works with CA-verified connection
+	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	tag := "a1"
+	var resp strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		resp.WriteString(line)
+		if strings.HasPrefix(line, tag+" ") {
+			break
+		}
+	}
+	if !strings.Contains(resp.String(), "a1 OK") {
+		t.Errorf("LOGIN should succeed with CA verification, got: %s", resp.String())
+	}
 }

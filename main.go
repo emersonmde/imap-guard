@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,112 @@ import (
 	"time"
 )
 
+type upstreamTLSMode int
+
+const (
+	upstreamPlaintext  upstreamTLSMode = iota
+	upstreamSTARTTLS
+	upstreamImplicitTLS
+)
+
+type config struct {
+	listenAddr     string
+	upstreamAddr   string
+	upstreamTLS    upstreamTLSMode
+	upstreamVerify string // "verify", "skip", or CA file path
+	clientTLSCert  string
+	clientTLSKey   string
+}
+
+func parseConfig() (*config, error) {
+	cfg := &config{
+		listenAddr:     envOrDefault("IMAP_GUARD_LISTEN", ":1143"),
+		upstreamAddr:   envOrDefault("IMAP_GUARD_UPSTREAM", "127.0.0.1:143"),
+		upstreamVerify: envOrDefault("IMAP_GUARD_UPSTREAM_VERIFY", "verify"),
+		clientTLSCert:  os.Getenv("IMAP_GUARD_CLIENT_TLS_CERT"),
+		clientTLSKey:   os.Getenv("IMAP_GUARD_CLIENT_TLS_KEY"),
+	}
+
+	switch strings.ToLower(envOrDefault("IMAP_GUARD_UPSTREAM_TLS", "starttls")) {
+	case "plaintext":
+		cfg.upstreamTLS = upstreamPlaintext
+	case "starttls":
+		cfg.upstreamTLS = upstreamSTARTTLS
+	case "tls":
+		cfg.upstreamTLS = upstreamImplicitTLS
+	default:
+		return nil, fmt.Errorf("invalid IMAP_GUARD_UPSTREAM_TLS value %q (must be plaintext, starttls, or tls)",
+			os.Getenv("IMAP_GUARD_UPSTREAM_TLS"))
+	}
+
+	// Verify settings are meaningless without TLS
+	if cfg.upstreamTLS == upstreamPlaintext && cfg.upstreamVerify != "verify" {
+		return nil, fmt.Errorf("IMAP_GUARD_UPSTREAM_VERIFY=%q has no effect with plaintext upstream (no TLS to verify)",
+			cfg.upstreamVerify)
+	}
+
+	// Validate verify setting
+	if cfg.upstreamVerify != "verify" && cfg.upstreamVerify != "skip" {
+		if _, err := os.Stat(cfg.upstreamVerify); err != nil {
+			return nil, fmt.Errorf("CA file %q: %w", cfg.upstreamVerify, err)
+		}
+	}
+
+	// Client TLS: both or neither
+	if (cfg.clientTLSCert == "") != (cfg.clientTLSKey == "") {
+		return nil, fmt.Errorf("IMAP_GUARD_CLIENT_TLS_CERT and IMAP_GUARD_CLIENT_TLS_KEY must both be set or both be empty")
+	}
+	if cfg.clientTLSCert != "" {
+		if _, err := os.Stat(cfg.clientTLSCert); err != nil {
+			return nil, fmt.Errorf("client TLS cert %q: %w", cfg.clientTLSCert, err)
+		}
+		if _, err := os.Stat(cfg.clientTLSKey); err != nil {
+			return nil, fmt.Errorf("client TLS key %q: %w", cfg.clientTLSKey, err)
+		}
+	}
+
+	return cfg, nil
+}
+
+func (c *config) clientTLSEnabled() bool {
+	return c.clientTLSCert != "" && c.clientTLSKey != ""
+}
+
+func (c *config) shouldStripCaps() bool {
+	return !c.clientTLSEnabled()
+}
+
+func (c *config) buildUpstreamTLSConfig() (*tls.Config, error) {
+	host, _, err := net.SplitHostPort(c.upstreamAddr)
+	if err != nil {
+		host = c.upstreamAddr
+	}
+
+	tlsCfg := &tls.Config{
+		ServerName: host,
+	}
+
+	switch c.upstreamVerify {
+	case "verify":
+		// Default system CA pool, no changes needed
+	case "skip":
+		tlsCfg.InsecureSkipVerify = true
+	default:
+		// CA file path
+		pemData, err := os.ReadFile(c.upstreamVerify)
+		if err != nil {
+			return nil, fmt.Errorf("read CA file %q: %w", c.upstreamVerify, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemData) {
+			return nil, fmt.Errorf("CA file %q contains no valid certificates", c.upstreamVerify)
+		}
+		tlsCfg.RootCAs = pool
+	}
+
+	return tlsCfg, nil
+}
+
 var protectedKeywords = []string{"trash", "drafts", "junk"}
 
 var reCapStrip = regexp.MustCompile(`(?i)\s+(STARTTLS|LOGINDISABLED)`)
@@ -25,15 +132,33 @@ type connState struct {
 }
 
 func main() {
-	listenAddr := envOrDefault("IMAP_GUARD_LISTEN", ":1143")
-	upstreamAddr := envOrDefault("IMAP_GUARD_UPSTREAM", "127.0.0.1:143")
+	cfg, err := parseConfig()
+	if err != nil {
+		log.Fatalf("config error: %v", err)
+	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("imap-guard starting: listen=%s upstream=%s", listenAddr, upstreamAddr)
+	log.Printf("imap-guard starting: listen=%s upstream=%s tls=%s",
+		cfg.listenAddr, cfg.upstreamAddr, []string{"plaintext", "starttls", "tls"}[cfg.upstreamTLS])
 
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("failed to listen on %s: %v", listenAddr, err)
+	var ln net.Listener
+	if cfg.clientTLSEnabled() {
+		cert, err := tls.LoadX509KeyPair(cfg.clientTLSCert, cfg.clientTLSKey)
+		if err != nil {
+			log.Fatalf("load client TLS cert/key: %v", err)
+		}
+		ln, err = tls.Listen("tcp", cfg.listenAddr, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		})
+		if err != nil {
+			log.Fatalf("failed to listen (TLS) on %s: %v", cfg.listenAddr, err)
+		}
+		log.Printf("client-side TLS enabled")
+	} else {
+		ln, err = net.Listen("tcp", cfg.listenAddr)
+		if err != nil {
+			log.Fatalf("failed to listen on %s: %v", cfg.listenAddr, err)
+		}
 	}
 
 	var connCounter uint64
@@ -45,7 +170,7 @@ func main() {
 		}
 		connID := fmt.Sprintf("C%d", atomic.AddUint64(&connCounter, 1))
 		log.Printf("ACCEPT %s from %s", connID, conn.RemoteAddr())
-		go handleClient(conn, upstreamAddr, connID)
+		go handleClient(conn, cfg, connID)
 	}
 }
 
@@ -56,18 +181,21 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func handleClient(clientConn net.Conn, upstreamAddr, connID string) {
+func handleClient(clientConn net.Conn, cfg *config, connID string) {
 	defer clientConn.Close()
 
-	upstreamConn, greeting, err := connectToUpstream(upstreamAddr)
+	upstreamConn, greeting, err := connectToUpstream(cfg)
 	if err != nil {
 		log.Printf("ERROR %s: upstream connect: %v", connID, err)
 		return
 	}
 	defer upstreamConn.Close()
 
-	// Send modified greeting to client
-	if _, err := clientConn.Write([]byte(stripCaps(greeting))); err != nil {
+	// Strip capabilities when proxy terminates TLS (client connects plaintext)
+	if cfg.shouldStripCaps() {
+		greeting = stripCaps(greeting)
+	}
+	if _, err := clientConn.Write([]byte(greeting)); err != nil {
 		log.Printf("ERROR %s: send greeting: %v", connID, err)
 		return
 	}
@@ -75,11 +203,12 @@ func handleClient(clientConn net.Conn, upstreamAddr, connID string) {
 	state := &connState{}
 	clientReader := bufio.NewReaderSize(clientConn, 8192)
 	upstreamReader := bufio.NewReaderSize(upstreamConn, 8192)
+	stripCapsRelay := cfg.shouldStripCaps()
 
 	done := make(chan struct{}, 2)
 
 	go func() {
-		relayServerToClient(upstreamReader, clientConn, connID)
+		relayServerToClient(upstreamReader, clientConn, connID, stripCapsRelay)
 		done <- struct{}{}
 	}()
 
@@ -96,28 +225,53 @@ func handleClient(clientConn net.Conn, upstreamAddr, connID string) {
 	log.Printf("CLOSED %s", connID)
 }
 
-func connectToUpstream(addr string) (net.Conn, string, error) {
+func connectToUpstream(cfg *config) (net.Conn, string, error) {
+	switch cfg.upstreamTLS {
+	case upstreamPlaintext:
+		return connectUpstreamPlaintext(cfg.upstreamAddr)
+	case upstreamSTARTTLS:
+		return connectUpstreamSTARTTLS(cfg)
+	case upstreamImplicitTLS:
+		return connectUpstreamTLS(cfg)
+	default:
+		return nil, "", fmt.Errorf("unknown upstream TLS mode: %d", cfg.upstreamTLS)
+	}
+}
+
+func connectUpstreamPlaintext(addr string) (net.Conn, string, error) {
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return nil, "", fmt.Errorf("dial: %w", err)
+	}
+
+	greeting, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, "", fmt.Errorf("read greeting: %w", err)
+	}
+
+	return conn, greeting, nil
+}
+
+func connectUpstreamSTARTTLS(cfg *config) (net.Conn, string, error) {
+	conn, err := net.DialTimeout("tcp", cfg.upstreamAddr, 10*time.Second)
 	if err != nil {
 		return nil, "", fmt.Errorf("dial: %w", err)
 	}
 
 	reader := bufio.NewReader(conn)
 
-	// Read greeting
 	greeting, err := reader.ReadString('\n')
 	if err != nil {
 		conn.Close()
 		return nil, "", fmt.Errorf("read greeting: %w", err)
 	}
 
-	// Send STARTTLS
 	if _, err := fmt.Fprintf(conn, "proxy0 STARTTLS\r\n"); err != nil {
 		conn.Close()
 		return nil, "", fmt.Errorf("send STARTTLS: %w", err)
 	}
 
-	// Read STARTTLS response
 	resp, err := reader.ReadString('\n')
 	if err != nil {
 		conn.Close()
@@ -128,16 +282,38 @@ func connectToUpstream(addr string) (net.Conn, string, error) {
 		return nil, "", fmt.Errorf("STARTTLS rejected: %s", strings.TrimSpace(resp))
 	}
 
-	// Upgrade to TLS
-	tlsConn := tls.Client(conn, &tls.Config{
-		InsecureSkipVerify: true,
-	})
+	tlsCfg, err := cfg.buildUpstreamTLSConfig()
+	if err != nil {
+		conn.Close()
+		return nil, "", err
+	}
+	tlsConn := tls.Client(conn, tlsCfg)
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
 		return nil, "", fmt.Errorf("TLS handshake: %w", err)
 	}
 
 	return tlsConn, greeting, nil
+}
+
+func connectUpstreamTLS(cfg *config) (net.Conn, string, error) {
+	tlsCfg, err := cfg.buildUpstreamTLSConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", cfg.upstreamAddr, tlsCfg)
+	if err != nil {
+		return nil, "", fmt.Errorf("dial TLS: %w", err)
+	}
+
+	greeting, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, "", fmt.Errorf("read greeting: %w", err)
+	}
+
+	return conn, greeting, nil
 }
 
 func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, state *connState, connID string) {
@@ -203,14 +379,16 @@ func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, st
 	}
 }
 
-func relayServerToClient(upstream *bufio.Reader, clientConn net.Conn, connID string) {
+func relayServerToClient(upstream *bufio.Reader, clientConn net.Conn, connID string, stripCapabilities bool) {
 	for {
 		line, err := upstream.ReadString('\n')
 		if err != nil {
 			return
 		}
 
-		line = stripCaps(line)
+		if stripCapabilities {
+			line = stripCaps(line)
+		}
 
 		if _, err := clientConn.Write([]byte(line)); err != nil {
 			return

@@ -24,6 +24,10 @@ All configuration is via environment variables.
 |---|---|---|
 | `IMAP_GUARD_LISTEN` | `:1143` | Address to listen on for client connections |
 | `IMAP_GUARD_UPSTREAM` | `127.0.0.1:143` | Upstream IMAP server address |
+| `IMAP_GUARD_UPSTREAM_TLS` | `starttls` | Upstream connection mode: `plaintext`, `starttls`, or `tls` |
+| `IMAP_GUARD_UPSTREAM_VERIFY` | `verify` | TLS verification: `verify` (system CAs), `skip` (insecure), or path to CA PEM file |
+| `IMAP_GUARD_CLIENT_TLS_CERT` | (empty) | Path to PEM certificate for client-facing TLS |
+| `IMAP_GUARD_CLIENT_TLS_KEY` | (empty) | Path to PEM private key for client-facing TLS |
 
 ### Protected mailboxes
 
@@ -51,25 +55,57 @@ All other IMAP commands pass through unmodified, including `COPY`, `FETCH`, `SEA
 
 ## Usage
 
-### Standard IMAP server
+### Standard IMAP server (implicit TLS, port 993)
 
 ```sh
-imap-guard
+IMAP_GUARD_UPSTREAM=imap.gmail.com:993 IMAP_GUARD_UPSTREAM_TLS=tls imap-guard
 ```
 
-Listens on `:1143`, connects upstream to `127.0.0.1:143` via STARTTLS. Point your IMAP client at `localhost:1143`.
+Connects to the upstream over implicit TLS and verifies the server certificate against system CAs. Point your IMAP client at `localhost:1143`.
+
+### STARTTLS upstream (default)
+
+```sh
+IMAP_GUARD_UPSTREAM=mail.example.com:143 imap-guard
+```
+
+Connects plaintext, upgrades to TLS via STARTTLS, and verifies the server certificate.
 
 ### Proton Bridge
 
-Proton Bridge listens on port `1143` by default. Run imap-guard on a different port and point it at Bridge:
+Proton Bridge uses STARTTLS with a self-signed certificate. Run imap-guard on a different port and skip certificate verification:
 
 ```sh
-IMAP_GUARD_LISTEN=:1144 IMAP_GUARD_UPSTREAM=127.0.0.1:1143 imap-guard
+IMAP_GUARD_LISTEN=:1144 IMAP_GUARD_UPSTREAM=127.0.0.1:1143 IMAP_GUARD_UPSTREAM_VERIFY=skip imap-guard
 ```
 
 Then configure your IMAP client to connect to `localhost:1144` instead of `1143`.
 
-The proxy handles STARTTLS negotiation and self-signed certificate validation with Bridge automatically. It strips `STARTTLS` and `LOGINDISABLED` capabilities from the client-facing connection so clients can authenticate in plaintext to the proxy.
+### Plaintext upstream (trusted network)
+
+```sh
+IMAP_GUARD_UPSTREAM=10.0.0.5:143 IMAP_GUARD_UPSTREAM_TLS=plaintext imap-guard
+```
+
+No TLS to the upstream. Only use this on a trusted network (loopback, VPN, etc.).
+
+### Custom CA verification
+
+```sh
+IMAP_GUARD_UPSTREAM=mail.internal:993 IMAP_GUARD_UPSTREAM_TLS=tls IMAP_GUARD_UPSTREAM_VERIFY=/etc/ssl/internal-ca.pem imap-guard
+```
+
+Verifies the upstream certificate against a custom CA instead of system CAs.
+
+### Client-side TLS
+
+```sh
+IMAP_GUARD_CLIENT_TLS_CERT=/etc/ssl/proxy-cert.pem IMAP_GUARD_CLIENT_TLS_KEY=/etc/ssl/proxy-key.pem imap-guard
+```
+
+Serves TLS to connecting IMAP clients. When client-side TLS is enabled, `STARTTLS` and `LOGINDISABLED` capabilities are not stripped from the upstream greeting (the client already has TLS).
+
+When client-side TLS is not configured, the proxy strips `STARTTLS` and `LOGINDISABLED` capabilities so clients can authenticate in plaintext to the proxy.
 
 ### systemd
 
@@ -81,7 +117,8 @@ After=network.target
 [Service]
 ExecStart=/path/to/imap-guard
 Environment=IMAP_GUARD_LISTEN=:1143
-Environment=IMAP_GUARD_UPSTREAM=127.0.0.1:143
+Environment=IMAP_GUARD_UPSTREAM=imap.gmail.com:993
+Environment=IMAP_GUARD_UPSTREAM_TLS=tls
 Restart=always
 
 [Install]

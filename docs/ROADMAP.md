@@ -60,17 +60,17 @@ Fix correctness issues found in code review.
 
 Remove Proton Bridge assumptions. Support any IMAP server.
 
-- [ ] Configurable upstream connection mode:
+- [x] Configurable upstream connection mode:
   - `plaintext` — connect without TLS (local/trusted network)
   - `starttls` — connect plaintext, upgrade via STARTTLS (current behavior)
   - `tls` — connect with implicit TLS (standard port 993 setup)
-- [ ] Configurable TLS verification:
+- [x] Configurable TLS verification:
   - `verify` (default) — validate upstream certificate against system CA pool
   - `skip` — `InsecureSkipVerify` for self-signed certs (current behavior, must be explicit)
   - `ca-file` — verify against a custom CA certificate (for private PKI)
-- [ ] Optional client-side TLS: serve TLS to clients instead of plaintext
-- [ ] Only strip STARTTLS/LOGINDISABLED when the proxy is handling TLS termination
-- [ ] Rename env var `IMAP_GUARD_UPSTREAM` default to `127.0.0.1:143` (standard IMAP)
+- [x] Optional client-side TLS: serve TLS to clients instead of plaintext
+- [x] Only strip STARTTLS/LOGINDISABLED when the proxy is handling TLS termination
+- [x] Rename env var `IMAP_GUARD_UPSTREAM` default to `127.0.0.1:143` (standard IMAP)
 
 ### Configuration
 
