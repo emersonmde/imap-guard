@@ -26,7 +26,7 @@ type connState struct {
 
 func main() {
 	listenAddr := envOrDefault("IMAP_GUARD_LISTEN", ":1143")
-	upstreamAddr := envOrDefault("IMAP_GUARD_UPSTREAM", "127.0.0.1:1143")
+	upstreamAddr := envOrDefault("IMAP_GUARD_UPSTREAM", "127.0.0.1:143")
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("imap-guard starting: listen=%s upstream=%s", listenAddr, upstreamAddr)
