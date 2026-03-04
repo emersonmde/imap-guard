@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -179,13 +180,15 @@ func TestLoadACLConfig(t *testing.T) {
 	t.Run("valid config", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.yaml")
-		os.WriteFile(path, []byte(`
+		if err := os.WriteFile(path, []byte(`
 rules:
   - mailbox: "*trash*"
     deny: [EXPUNGE, CLOSE, "STORE +\\Deleted"]
   - mailbox: "*drafts*"
     deny: [DELETE, RENAME]
-`), 0o600)
+`), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
 
 		rules, err := loadACLConfig(path)
 		if err != nil {
@@ -212,7 +215,9 @@ rules:
 	t.Run("invalid YAML", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "bad.yaml")
-		os.WriteFile(path, []byte("not: [valid: yaml"), 0o600)
+		if err := os.WriteFile(path, []byte("not: [valid: yaml"), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
 
 		_, err := loadACLConfig(path)
 		if err == nil {
@@ -223,11 +228,13 @@ rules:
 	t.Run("invalid deny entry", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "bad-deny.yaml")
-		os.WriteFile(path, []byte(`
+		if err := os.WriteFile(path, []byte(`
 rules:
   - mailbox: "*trash*"
     deny: [BADCOMMAND]
-`), 0o600)
+`), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
 
 		_, err := loadACLConfig(path)
 		if err == nil {
@@ -238,10 +245,12 @@ rules:
 	t.Run("missing mailbox", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "no-mailbox.yaml")
-		os.WriteFile(path, []byte(`
+		if err := os.WriteFile(path, []byte(`
 rules:
   - deny: [EXPUNGE]
-`), 0o600)
+`), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
 
 		_, err := loadACLConfig(path)
 		if err == nil {
@@ -252,7 +261,9 @@ rules:
 	t.Run("empty file returns empty rules", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "empty.yaml")
-		os.WriteFile(path, []byte(""), 0o600)
+		if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
 
 		rules, err := loadACLConfig(path)
 		if err != nil {
@@ -260,6 +271,76 @@ rules:
 		}
 		if len(rules) != 0 {
 			t.Errorf("expected 0 rules, got %d", len(rules))
+		}
+	})
+}
+
+func TestLoadACLConfigDenyUnlessCopied(t *testing.T) {
+	t.Run("valid deny-unless-copied", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		if err := os.WriteFile(path, []byte(`
+rules:
+  - mailbox: "*trash*"
+    deny: [DELETE, RENAME, CLOSE]
+    deny-unless-copied: [expunge]
+`), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
+
+		rules, err := loadACLConfig(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(rules))
+		}
+		if len(rules[0].denyUnlessCopied) != 1 {
+			t.Fatalf("expected 1 deny-unless-copied entry, got %d", len(rules[0].denyUnlessCopied))
+		}
+		if rules[0].denyUnlessCopied[0] != "EXPUNGE" {
+			t.Errorf("expected EXPUNGE, got %q", rules[0].denyUnlessCopied[0])
+		}
+	})
+
+	t.Run("overlap with deny rejects", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		if err := os.WriteFile(path, []byte(`
+rules:
+  - mailbox: "*trash*"
+    deny: [EXPUNGE, DELETE]
+    deny-unless-copied: [EXPUNGE]
+`), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
+
+		_, err := loadACLConfig(path)
+		if err == nil {
+			t.Fatal("expected error for overlapping deny and deny-unless-copied")
+		}
+		if !strings.Contains(err.Error(), "both deny and deny-unless-copied") {
+			t.Errorf("error should mention overlap, got: %v", err)
+		}
+	})
+
+	t.Run("invalid command rejects", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		if err := os.WriteFile(path, []byte(`
+rules:
+  - mailbox: "*trash*"
+    deny-unless-copied: [CLOSE]
+`), 0o600); err != nil {
+			t.Fatalf("write test config: %v", err)
+		}
+
+		_, err := loadACLConfig(path)
+		if err == nil {
+			t.Fatal("expected error for invalid command in deny-unless-copied")
+		}
+		if !strings.Contains(err.Error(), "only supports EXPUNGE") {
+			t.Errorf("error should mention EXPUNGE requirement, got: %v", err)
 		}
 	})
 }
@@ -319,47 +400,49 @@ func TestEvalACL(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		mailbox   string
-		cmd       string
-		storeOp   string
+		name       string
+		mailbox    string
+		cmd        string
+		storeOp    string
 		storeFlags string
-		wantBlock bool
+		wantResult aclResult
 	}{
-		{"expunge in trash", "Trash", "EXPUNGE", "", "", true},
-		{"close in trash", "Trash", "CLOSE", "", "", true},
-		{"store deleted in trash", "Trash", "STORE", "+", `(\DELETED)`, true},
-		{"store seen in trash", "Trash", "STORE", "+", `(\SEEN)`, false},
-		{"remove deleted in trash", "Trash", "STORE", "-", `(\DELETED)`, false},
-		{"delete in drafts", "Drafts", "DELETE", "", "", true},
-		{"rename in drafts", "Drafts", "RENAME", "", "", true},
-		{"expunge in drafts", "Drafts", "EXPUNGE", "", "", false},
-		{"expunge in inbox", "INBOX", "EXPUNGE", "", "", false},
-		{"nil rules never blocks", "Trash", "EXPUNGE", "", "", false},
+		{"expunge in trash", "Trash", "EXPUNGE", "", "", aclDeny},
+		{"close in trash", "Trash", "CLOSE", "", "", aclDeny},
+		{"store deleted in trash", "Trash", "STORE", "+", `(\DELETED)`, aclDeny},
+		{"store seen in trash", "Trash", "STORE", "+", `(\SEEN)`, aclAllow},
+		{"remove deleted in trash", "Trash", "STORE", "-", `(\DELETED)`, aclAllow},
+		{"delete in drafts", "Drafts", "DELETE", "", "", aclDeny},
+		{"rename in drafts", "Drafts", "RENAME", "", "", aclDeny},
+		{"expunge in drafts", "Drafts", "EXPUNGE", "", "", aclAllow},
+		{"expunge in inbox", "INBOX", "EXPUNGE", "", "", aclAllow},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := rules
-			if tt.name == "nil rules never blocks" {
-				r = nil
-			}
-			blocked, _ := evalACL(r, tt.mailbox, tt.cmd, tt.storeOp, tt.storeFlags)
-			if blocked != tt.wantBlock {
-				t.Errorf("evalACL(%q, %q) blocked=%v, want %v",
-					tt.mailbox, tt.cmd, blocked, tt.wantBlock)
+			result, _ := evalACL(rules, tt.mailbox, tt.cmd, tt.storeOp, tt.storeFlags)
+			if result != tt.wantResult {
+				t.Errorf("evalACL(%q, %q) result=%v, want %v",
+					tt.mailbox, tt.cmd, result, tt.wantResult)
 			}
 		})
 	}
+
+	t.Run("nil rules never blocks", func(t *testing.T) {
+		result, _ := evalACL(nil, "Trash", "EXPUNGE", "", "")
+		if result != aclAllow {
+			t.Errorf("evalACL with nil rules should return aclAllow, got %v", result)
+		}
+	})
 
 	t.Run("first match wins", func(t *testing.T) {
 		overlapping := []rule{
 			{mailbox: "Trash", deny: []denyEntry{{command: "EXPUNGE"}}},
 			{mailbox: "*", deny: nil}, // catch-all with no denies
 		}
-		blocked, desc := evalACL(overlapping, "Trash", "EXPUNGE", "", "")
-		if !blocked {
-			t.Errorf("expected block from first rule, got allow")
+		result, desc := evalACL(overlapping, "Trash", "EXPUNGE", "", "")
+		if result != aclDeny {
+			t.Errorf("expected aclDeny from first rule, got %v", result)
 		}
 		if !strings.Contains(desc, "rule[0]") {
 			t.Errorf("expected rule[0] in desc, got %q", desc)
@@ -370,8 +453,8 @@ func TestEvalACL(t *testing.T) {
 		wildcardRules := []rule{
 			{mailbox: "*", deny: []denyEntry{{command: "EXPUNGE"}}},
 		}
-		blocked, _ := evalACL(wildcardRules, "INBOX", "EXPUNGE", "", "")
-		if !blocked {
+		result, _ := evalACL(wildcardRules, "INBOX", "EXPUNGE", "", "")
+		if result != aclDeny {
 			t.Error("expected wildcard rule to block EXPUNGE on any mailbox")
 		}
 	})
@@ -380,11 +463,49 @@ func TestEvalACL(t *testing.T) {
 		storeAllRules := []rule{
 			{mailbox: "*trash*", deny: []denyEntry{{command: "STORE"}}},
 		}
-		blocked, _ := evalACL(storeAllRules, "Trash", "STORE", "+", `(\SEEN)`)
-		if !blocked {
+		result, _ := evalACL(storeAllRules, "Trash", "STORE", "+", `(\SEEN)`)
+		if result != aclDeny {
 			t.Error("expected unqualified STORE deny to block all STORE commands")
 		}
 	})
+}
+
+func TestEvalACLDenyUnlessCopied(t *testing.T) {
+	rules := []rule{
+		{
+			mailbox:          "*trash*",
+			deny:             []denyEntry{{command: "DELETE"}, {command: "CLOSE"}},
+			denyUnlessCopied: []string{"EXPUNGE"},
+		},
+		{
+			mailbox: "*drafts*",
+			deny:    []denyEntry{{command: "EXPUNGE"}},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		mailbox    string
+		cmd        string
+		wantResult aclResult
+	}{
+		{"expunge in trash returns deny-unless-copied", "Trash", "EXPUNGE", aclDenyUnlessCopied},
+		{"delete in trash returns deny", "Trash", "DELETE", aclDeny},
+		{"close in trash returns deny", "Trash", "CLOSE", aclDeny},
+		{"move in trash returns allow", "Trash", "MOVE", aclAllow},
+		{"expunge in drafts returns deny", "Drafts", "EXPUNGE", aclDeny},
+		{"expunge in inbox returns allow", "INBOX", "EXPUNGE", aclAllow},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, _ := evalACL(rules, tt.mailbox, tt.cmd, "", "")
+			if result != tt.wantResult {
+				t.Errorf("evalACL(%q, %q) result=%v, want %v",
+					tt.mailbox, tt.cmd, result, tt.wantResult)
+			}
+		})
+	}
 }
 
 func TestShouldBlock(t *testing.T) {
@@ -490,6 +611,76 @@ func TestShouldBlock(t *testing.T) {
 	}
 }
 
+func TestShouldBlockDenyUnlessCopied(t *testing.T) {
+	rules := []rule{
+		{
+			mailbox:          "*trash*",
+			deny:             []denyEntry{{command: "CLOSE"}, {command: "DELETE"}},
+			denyUnlessCopied: []string{"EXPUNGE"},
+		},
+	}
+
+	t.Run("plain EXPUNGE always blocked", func(t *testing.T) {
+		state := &connState{selectedMailbox: "Trash"}
+		state.recordCopiedUIDs([]uint32{1, 2, 3})
+		blocked, _ := shouldBlock("EXPUNGE", "", state, rules)
+		if !blocked {
+			t.Error("plain EXPUNGE should always be blocked under deny-unless-copied")
+		}
+	})
+
+	t.Run("UID EXPUNGE with all UIDs copied", func(t *testing.T) {
+		state := &connState{selectedMailbox: "Trash"}
+		state.recordCopiedUIDs([]uint32{1, 2, 3})
+		blocked, _ := shouldBlock("UID", "EXPUNGE 1:3", state, rules)
+		if blocked {
+			t.Error("UID EXPUNGE should be allowed when all UIDs are copied")
+		}
+	})
+
+	t.Run("UID EXPUNGE with not all UIDs copied", func(t *testing.T) {
+		state := &connState{selectedMailbox: "Trash"}
+		state.recordCopiedUIDs([]uint32{1, 2})
+		blocked, _ := shouldBlock("UID", "EXPUNGE 1:5", state, rules)
+		if !blocked {
+			t.Error("UID EXPUNGE should be blocked when not all UIDs are copied")
+		}
+	})
+
+	t.Run("UID EXPUNGE with no copies", func(t *testing.T) {
+		state := &connState{selectedMailbox: "Trash"}
+		blocked, _ := shouldBlock("UID", "EXPUNGE 1:3", state, rules)
+		if !blocked {
+			t.Error("UID EXPUNGE should be blocked when no UIDs have been copied")
+		}
+	})
+
+	t.Run("UID EXPUNGE with unparseable set", func(t *testing.T) {
+		state := &connState{selectedMailbox: "Trash"}
+		state.recordCopiedUIDs([]uint32{1, 2, 3})
+		blocked, _ := shouldBlock("UID", "EXPUNGE *", state, rules)
+		if !blocked {
+			t.Error("UID EXPUNGE with * should be blocked (unparseable)")
+		}
+	})
+
+	t.Run("UID EXPUNGE in unprotected mailbox", func(t *testing.T) {
+		state := &connState{selectedMailbox: "INBOX"}
+		blocked, _ := shouldBlock("UID", "EXPUNGE 1:3", state, rules)
+		if blocked {
+			t.Error("UID EXPUNGE in unprotected mailbox should be allowed")
+		}
+	})
+
+	t.Run("CLOSE still hard-denied", func(t *testing.T) {
+		state := &connState{selectedMailbox: "Trash"}
+		blocked, _ := shouldBlock("CLOSE", "", state, rules)
+		if !blocked {
+			t.Error("CLOSE should still be hard-denied")
+		}
+	})
+}
+
 func TestStripCaps(t *testing.T) {
 	tests := []struct {
 		line string
@@ -554,6 +745,175 @@ func TestParseLiteral(t *testing.T) {
 			t.Errorf("parseLiteral(%q) = (%d, %v), want (%d, %v)",
 				tt.line, n, ok, tt.wantN, tt.wantOK)
 		}
+	}
+}
+
+func TestParseUIDSet(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantUIDs []uint32
+		wantOK  bool
+	}{
+		// Single UID
+		{"1", []uint32{1}, true},
+		{"100", []uint32{100}, true},
+
+		// Ranges
+		{"1:5", []uint32{1, 2, 3, 4, 5}, true},
+		{"3:1", []uint32{1, 2, 3}, true}, // reversed range
+
+		// Comma-separated
+		{"1,3,5", []uint32{1, 3, 5}, true},
+
+		// Mixed
+		{"1:3,5:7", []uint32{1, 2, 3, 5, 6, 7}, true},
+		{"1,3:5,10", []uint32{1, 3, 4, 5, 10}, true},
+
+		// Wildcard — not supported
+		{"*", nil, false},
+		{"1:*", nil, false},
+
+		// Zero UID — invalid
+		{"0", nil, false},
+		{"0:5", nil, false},
+
+		// Parse errors
+		{"abc", nil, false},
+		{"1:abc", nil, false},
+		{"", nil, false},
+		{",", nil, false},
+		{"1,", nil, false},
+	}
+	for _, tt := range tests {
+		uids, ok := parseUIDSet(tt.input)
+		if ok != tt.wantOK {
+			t.Errorf("parseUIDSet(%q) ok=%v, want %v", tt.input, ok, tt.wantOK)
+			continue
+		}
+		if ok && !slices.Equal(uids, tt.wantUIDs) {
+			t.Errorf("parseUIDSet(%q) = %v, want %v", tt.input, uids, tt.wantUIDs)
+		}
+	}
+
+	t.Run("huge range exceeds cap", func(t *testing.T) {
+		_, ok := parseUIDSet("1:100000")
+		if ok {
+			t.Error("expected rejection for range exceeding cap")
+		}
+	})
+}
+
+func TestParseCOPYUID(t *testing.T) {
+	tests := []struct {
+		line     string
+		wantUIDs []uint32
+		wantOK   bool
+	}{
+		// Valid
+		{"a1 OK [COPYUID 12345 1:3 10:12] Copy completed\r\n", []uint32{1, 2, 3}, true},
+		{"a1 OK [COPYUID 12345 5 20] Copy completed\r\n", []uint32{5}, true},
+		{"a1 OK [COPYUID 12345 1,3,5 10,12,14] Copy completed\r\n", []uint32{1, 3, 5}, true},
+
+		// Case insensitive
+		{"a1 OK [copyuid 12345 1:3 10:12] Copy completed\r\n", []uint32{1, 2, 3}, true},
+		{"a1 OK [CopyUID 12345 1:3 10:12] Copy completed\r\n", []uint32{1, 2, 3}, true},
+
+		// No COPYUID
+		{"a1 OK Copy completed\r\n", nil, false},
+
+		// Malformed — missing fields
+		{"a1 OK [COPYUID 12345 1:3] Copy completed\r\n", nil, false},
+		{"a1 OK [COPYUID 12345] Copy completed\r\n", nil, false},
+
+		// Missing closing bracket
+		{"a1 OK [COPYUID 12345 1:3 10:12 Copy completed\r\n", nil, false},
+	}
+	for _, tt := range tests {
+		uids, ok := parseCOPYUID(tt.line)
+		if ok != tt.wantOK {
+			t.Errorf("parseCOPYUID(%q) ok=%v, want %v", tt.line, ok, tt.wantOK)
+			continue
+		}
+		if ok && !slices.Equal(uids, tt.wantUIDs) {
+			t.Errorf("parseCOPYUID(%q) = %v, want %v", tt.line, uids, tt.wantUIDs)
+		}
+	}
+}
+
+func TestParseTaggedResponse(t *testing.T) {
+	tests := []struct {
+		line    string
+		wantTag string
+		wantRest string
+	}{
+		{"a1 OK done\r\n", "a1", "OK done"},
+		{"tag5 NO error\r\n", "tag5", "NO error"},
+		{"* 5 EXISTS\r\n", "", ""},
+		{"+ continue\r\n", "", ""},
+		{"\r\n", "", ""},
+		{"a1\r\n", "a1", ""},
+	}
+	for _, tt := range tests {
+		tag, rest := parseTaggedResponse(tt.line)
+		if tag != tt.wantTag || rest != tt.wantRest {
+			t.Errorf("parseTaggedResponse(%q) = (%q, %q), want (%q, %q)",
+				tt.line, tag, rest, tt.wantTag, tt.wantRest)
+		}
+	}
+}
+
+func TestConnStateCopyTracking(t *testing.T) {
+	s := &connState{}
+
+	// Record a pending copy
+	s.recordPendingCopy("a1")
+
+	// Resolve it
+	if !s.resolvePendingCopy("a1") {
+		t.Error("expected resolvePendingCopy to return true for recorded tag")
+	}
+
+	// Resolve again — should fail
+	if s.resolvePendingCopy("a1") {
+		t.Error("expected resolvePendingCopy to return false for already-resolved tag")
+	}
+
+	// Resolve unrecorded tag
+	if s.resolvePendingCopy("a2") {
+		t.Error("expected resolvePendingCopy to return false for unrecorded tag")
+	}
+
+	// Record and check copied UIDs
+	s.recordCopiedUIDs([]uint32{1, 2, 3})
+	if !s.allUIDsCopied([]uint32{1, 2, 3}) {
+		t.Error("expected allUIDsCopied to return true for recorded UIDs")
+	}
+	if !s.allUIDsCopied([]uint32{1}) {
+		t.Error("expected allUIDsCopied to return true for subset")
+	}
+	if s.allUIDsCopied([]uint32{1, 4}) {
+		t.Error("expected allUIDsCopied to return false when UID 4 not recorded")
+	}
+
+	// Add more UIDs
+	s.recordCopiedUIDs([]uint32{4, 5})
+	if !s.allUIDsCopied([]uint32{1, 2, 3, 4, 5}) {
+		t.Error("expected allUIDsCopied to return true after adding more UIDs")
+	}
+}
+
+func TestConnStateResetCopyState(t *testing.T) {
+	s := &connState{}
+	s.recordPendingCopy("a1")
+	s.recordCopiedUIDs([]uint32{1, 2, 3})
+
+	s.resetCopyState()
+
+	if s.resolvePendingCopy("a1") {
+		t.Error("expected pending copies to be cleared after reset")
+	}
+	if s.allUIDsCopied([]uint32{1}) {
+		t.Error("expected copied UIDs to be cleared after reset")
 	}
 }
 
@@ -903,12 +1263,13 @@ func writeTestACLConfig(t *testing.T) string {
 
 // mockUpstream simulates an upstream IMAP server supporting different connection modes.
 type mockUpstream struct {
-	listener net.Listener
-	received []string
-	errors   []string
-	mu       sync.Mutex
-	cert     tls.Certificate
-	mode     mockUpstreamMode
+	listener       net.Listener
+	received       []string
+	errors         []string
+	mu             sync.Mutex
+	cert           tls.Certificate
+	mode           mockUpstreamMode
+	supportCOPYUID bool // when true, COPY/UID COPY/UID MOVE responses include COPYUID
 }
 
 func newMockUpstream(t *testing.T, mode mockUpstreamMode) *mockUpstream {
@@ -1082,6 +1443,15 @@ func (m *mockUpstream) handleIMAPCommands(conn net.Conn) {
 			fmt.Fprintf(conn, "* 0 RECENT\r\n")
 			fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
 			fmt.Fprintf(conn, "%s OK [READ-WRITE] %s selected\r\n", tag, mailbox)
+		case "COPY":
+			if m.supportCOPYUID && len(parts) > 2 {
+				// Extract sequence set from "seqset mailbox" args
+				copyArgs := strings.SplitN(parts[2], " ", 2)
+				seqSet := copyArgs[0]
+				fmt.Fprintf(conn, "%s OK [COPYUID 12345 %s %s] COPY completed\r\n", tag, seqSet, seqSet)
+			} else {
+				fmt.Fprintf(conn, "%s OK COPY completed\r\n", tag)
+			}
 		case "STORE":
 			fmt.Fprintf(conn, "%s OK STORE completed\r\n", tag)
 		case "EXPUNGE":
@@ -1092,7 +1462,14 @@ func (m *mockUpstream) handleIMAPCommands(conn net.Conn) {
 			if len(parts) > 2 {
 				subParts := strings.SplitN(parts[2], " ", 2)
 				subCmd := strings.ToUpper(subParts[0])
-				fmt.Fprintf(conn, "%s OK UID %s completed\r\n", tag, subCmd)
+				if m.supportCOPYUID && (subCmd == "COPY" || subCmd == "MOVE") && len(subParts) > 1 {
+					// Extract UID set from "uidset mailbox" args
+					uidArgs := strings.SplitN(subParts[1], " ", 2)
+					uidSet := uidArgs[0]
+					fmt.Fprintf(conn, "%s OK [COPYUID 12345 %s %s] UID %s completed\r\n", tag, uidSet, uidSet, subCmd)
+				} else {
+					fmt.Fprintf(conn, "%s OK UID %s completed\r\n", tag, subCmd)
+				}
 			} else {
 				fmt.Fprintf(conn, "%s OK UID completed\r\n", tag)
 			}
@@ -1677,59 +2054,13 @@ func TestCAFileVerification(t *testing.T) {
 }
 
 func TestNoConfigPassThrough(t *testing.T) {
-	upstream := newMockUpstream(t, mockSTARTTLS)
-	defer upstream.listener.Close()
-	go upstream.serve()
+	_, connect, sendAndRead := startProxy(t, nil) // nil rules = no blocking
 
-	cfg := testConfig(upstream.addr())
-
-	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("proxy listen: %v", err)
-	}
-	defer proxyLn.Close()
-
-	go func() {
-		for {
-			conn, err := proxyLn.Accept()
-			if err != nil {
-				return
-			}
-			go handleClient(conn, cfg, nil, "test") // nil rules = no blocking
-		}
-	}()
-
-	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
-	if err != nil {
-		t.Fatalf("client connect: %v", err)
-	}
+	reader, conn := connect(t)
 	defer conn.Close()
 
-	reader := bufio.NewReader(conn)
-	// Read greeting
-	if _, err := reader.ReadString('\n'); err != nil {
-		t.Fatalf("read greeting: %v", err)
-	}
-
-	sendAndRead := func(cmd string) string {
-		fmt.Fprintf(conn, "%s\r\n", cmd)
-		tag := strings.SplitN(cmd, " ", 2)[0]
-		var resp strings.Builder
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				t.Fatalf("read response for %q: %v", cmd, err)
-			}
-			resp.WriteString(line)
-			if strings.HasPrefix(line, tag+" ") {
-				break
-			}
-		}
-		return resp.String()
-	}
-
-	sendAndRead("a1 LOGIN user pass")
-	sendAndRead("a2 SELECT Trash")
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
 
 	// All these should pass through without blocking (no rules)
 	commands := []struct {
@@ -1742,7 +2073,7 @@ func TestNoConfigPassThrough(t *testing.T) {
 	}
 
 	for _, tc := range commands {
-		resp := sendAndRead(tc.cmd)
+		resp := sendAndRead(t, reader, conn, tc.cmd)
 		if !strings.Contains(resp, tc.wantOK) {
 			t.Errorf("with nil rules, %q should pass through, got: %s", tc.cmd, resp)
 		}
@@ -1750,78 +2081,33 @@ func TestNoConfigPassThrough(t *testing.T) {
 }
 
 func TestWildcardRules(t *testing.T) {
-	upstream := newMockUpstream(t, mockSTARTTLS)
-	defer upstream.listener.Close()
-	go upstream.serve()
-
-	cfg := testConfig(upstream.addr())
-
 	// Wildcard rule: block EXPUNGE on all mailboxes
 	wildcardRules := []rule{
 		{mailbox: "*", deny: []denyEntry{{command: "EXPUNGE"}}},
 	}
 
-	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("proxy listen: %v", err)
-	}
-	defer proxyLn.Close()
+	_, connect, sendAndRead := startProxy(t, wildcardRules)
 
-	go func() {
-		for {
-			conn, err := proxyLn.Accept()
-			if err != nil {
-				return
-			}
-			go handleClient(conn, cfg, wildcardRules, "test")
-		}
-	}()
-
-	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
-	if err != nil {
-		t.Fatalf("client connect: %v", err)
-	}
+	reader, conn := connect(t)
 	defer conn.Close()
 
-	reader := bufio.NewReader(conn)
-	if _, err := reader.ReadString('\n'); err != nil {
-		t.Fatalf("read greeting: %v", err)
-	}
-
-	sendAndRead := func(cmd string) string {
-		fmt.Fprintf(conn, "%s\r\n", cmd)
-		tag := strings.SplitN(cmd, " ", 2)[0]
-		var resp strings.Builder
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				t.Fatalf("read response for %q: %v", cmd, err)
-			}
-			resp.WriteString(line)
-			if strings.HasPrefix(line, tag+" ") {
-				break
-			}
-		}
-		return resp.String()
-	}
-
-	sendAndRead("a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
 	// EXPUNGE should be blocked in any mailbox
-	sendAndRead("a2 SELECT INBOX")
-	resp := sendAndRead("a3 EXPUNGE")
+	sendAndRead(t, reader, conn, "a2 SELECT INBOX")
+	resp := sendAndRead(t, reader, conn, "a3 EXPUNGE")
 	if !strings.Contains(resp, "a3 NO") {
 		t.Errorf("wildcard rule should block EXPUNGE in INBOX, got: %s", resp)
 	}
 
-	sendAndRead("a4 SELECT Trash")
-	resp = sendAndRead("a5 EXPUNGE")
+	sendAndRead(t, reader, conn, "a4 SELECT Trash")
+	resp = sendAndRead(t, reader, conn, "a5 EXPUNGE")
 	if !strings.Contains(resp, "a5 NO") {
 		t.Errorf("wildcard rule should block EXPUNGE in Trash, got: %s", resp)
 	}
 
 	// Other commands should still pass through
-	resp = sendAndRead("a6 NOOP")
+	resp = sendAndRead(t, reader, conn, "a6 NOOP")
 	if !strings.Contains(resp, "a6 OK") {
 		t.Errorf("NOOP should pass through with wildcard EXPUNGE rule, got: %s", resp)
 	}
@@ -1840,20 +2126,273 @@ func TestLoadACLConfigFromYAML(t *testing.T) {
 	}
 
 	// Verify rules work: EXPUNGE in Trash should be blocked
-	blocked, _ := evalACL(rules, "Trash", "EXPUNGE", "", "")
-	if !blocked {
+	result, _ := evalACL(rules, "Trash", "EXPUNGE", "", "")
+	if result != aclDeny {
 		t.Error("expected EXPUNGE in Trash to be blocked by loaded rules")
 	}
 
 	// STORE +\Deleted in Drafts should be blocked
-	blocked, _ = evalACL(rules, "Drafts", "STORE", "+", `(\DELETED)`)
-	if !blocked {
+	result, _ = evalACL(rules, "Drafts", "STORE", "+", `(\DELETED)`)
+	if result != aclDeny {
 		t.Error("expected STORE +\\Deleted in Drafts to be blocked by loaded rules")
 	}
 
 	// EXPUNGE in INBOX should not be blocked
-	blocked, _ = evalACL(rules, "INBOX", "EXPUNGE", "", "")
-	if blocked {
+	result, _ = evalACL(rules, "INBOX", "EXPUNGE", "", "")
+	if result != aclAllow {
 		t.Error("expected EXPUNGE in INBOX to be allowed by loaded rules")
+	}
+}
+
+// testDenyUnlessCopiedRules returns ACL rules with deny-unless-copied for EXPUNGE on trash.
+func testDenyUnlessCopiedRules() []rule {
+	return []rule{
+		{
+			mailbox: "*trash*",
+			deny: []denyEntry{
+				{command: "CLOSE"}, {command: "DELETE"},
+				{command: "RENAME"}, {command: "MOVE"}, {command: "COMPRESS"},
+				{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+			},
+			denyUnlessCopied: []string{"EXPUNGE"},
+		},
+		{
+			mailbox: "*drafts*",
+			deny: []denyEntry{
+				{command: "EXPUNGE"}, {command: "CLOSE"}, {command: "DELETE"},
+				{command: "RENAME"}, {command: "MOVE"}, {command: "COMPRESS"},
+				{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+			},
+		},
+	}
+}
+
+// startProxy starts a proxy+upstream and returns helpers for connecting and sending commands.
+func startProxy(t *testing.T, rules []rule) (upstream *mockUpstream,
+	connect func(t *testing.T) (*bufio.Reader, net.Conn),
+	sendAndRead func(t *testing.T, reader *bufio.Reader, conn net.Conn, cmd string) string) {
+	t.Helper()
+
+	upstream = newMockUpstream(t, mockSTARTTLS)
+	t.Cleanup(func() { upstream.listener.Close() })
+	go upstream.serve()
+
+	cfg := testConfig(upstream.addr())
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	t.Cleanup(func() { proxyLn.Close() })
+
+	go func() {
+		for {
+			conn, err := proxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleClient(conn, cfg, rules, "test")
+		}
+	}()
+
+	connect = func(t *testing.T) (*bufio.Reader, net.Conn) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatalf("client connect: %v", err)
+		}
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Fatalf("read greeting: %v", err)
+		}
+		return reader, conn
+	}
+
+	sendAndRead = func(t *testing.T, reader *bufio.Reader, conn net.Conn, cmd string) string {
+		t.Helper()
+		fmt.Fprintf(conn, "%s\r\n", cmd)
+		tag := strings.SplitN(cmd, " ", 2)[0]
+		var resp strings.Builder
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("read response for %q: %v", cmd, err)
+			}
+			resp.WriteString(line)
+			if strings.HasPrefix(line, tag+" ") {
+				break
+			}
+		}
+		return resp.String()
+	}
+
+	return
+}
+
+// startProxyWithCOPYUID starts a proxy+upstream with COPYUID support control.
+func startProxyWithCOPYUID(t *testing.T, rules []rule, supportCOPYUID bool) (upstream *mockUpstream,
+	connect func(t *testing.T) (*bufio.Reader, net.Conn),
+	sendAndRead func(t *testing.T, reader *bufio.Reader, conn net.Conn, cmd string) string) {
+	t.Helper()
+	upstream, connect, sendAndRead = startProxy(t, rules)
+	upstream.supportCOPYUID = supportCOPYUID
+	return upstream, connect, sendAndRead
+}
+
+func TestDenyUnlessCopiedWorkflow(t *testing.T) {
+	rules := testDenyUnlessCopiedRules()
+	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
+
+	reader, conn := connect(t)
+	defer conn.Close()
+
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
+
+	// UID COPY 1:3 to Archive — server returns COPYUID
+	resp := sendAndRead(t, reader, conn, "a3 UID COPY 1:3 Archive")
+	if !strings.Contains(resp, "a3 OK") {
+		t.Fatalf("UID COPY should succeed, got: %s", resp)
+	}
+
+	// UID EXPUNGE 1:3 — should be allowed since all UIDs were copied
+	resp = sendAndRead(t, reader, conn, "a4 UID EXPUNGE 1:3")
+	if !strings.Contains(resp, "a4 OK") {
+		t.Errorf("UID EXPUNGE 1:3 should be allowed after COPY, got: %s", resp)
+	}
+}
+
+func TestDenyUnlessCopiedBlocked(t *testing.T) {
+	rules := testDenyUnlessCopiedRules()
+	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
+
+	reader, conn := connect(t)
+	defer conn.Close()
+
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
+
+	// UID EXPUNGE without prior COPY — should be blocked
+	resp := sendAndRead(t, reader, conn, "a3 UID EXPUNGE 1:3")
+	if !strings.Contains(resp, "a3 NO") {
+		t.Errorf("UID EXPUNGE without prior COPY should be blocked, got: %s", resp)
+	}
+}
+
+func TestDenyUnlessCopiedPartial(t *testing.T) {
+	rules := testDenyUnlessCopiedRules()
+	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
+
+	reader, conn := connect(t)
+	defer conn.Close()
+
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
+
+	// Copy only UIDs 1:3
+	sendAndRead(t, reader, conn, "a3 UID COPY 1:3 Archive")
+
+	// Try to expunge 1:5 — UIDs 4,5 were not copied
+	resp := sendAndRead(t, reader, conn, "a4 UID EXPUNGE 1:5")
+	if !strings.Contains(resp, "a4 NO") {
+		t.Errorf("UID EXPUNGE 1:5 should be blocked when only 1:3 copied, got: %s", resp)
+	}
+}
+
+func TestDenyUnlessCopiedPlainExpunge(t *testing.T) {
+	rules := testDenyUnlessCopiedRules()
+	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
+
+	reader, conn := connect(t)
+	defer conn.Close()
+
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
+
+	// Copy some UIDs
+	sendAndRead(t, reader, conn, "a3 UID COPY 1:3 Archive")
+
+	// Plain EXPUNGE — always blocked under deny-unless-copied
+	resp := sendAndRead(t, reader, conn, "a4 EXPUNGE")
+	if !strings.Contains(resp, "a4 NO") {
+		t.Errorf("plain EXPUNGE should always be blocked under deny-unless-copied, got: %s", resp)
+	}
+}
+
+func TestDenyUnlessCopiedMailboxSwitch(t *testing.T) {
+	rules := testDenyUnlessCopiedRules()
+	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
+
+	reader, conn := connect(t)
+	defer conn.Close()
+
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
+
+	// Copy UIDs 1:3
+	sendAndRead(t, reader, conn, "a3 UID COPY 1:3 Archive")
+
+	// Switch to INBOX, then back to Trash — state should be cleared
+	sendAndRead(t, reader, conn, "a4 SELECT INBOX")
+	sendAndRead(t, reader, conn, "a5 SELECT Trash")
+
+	// UID EXPUNGE 1:3 — should be blocked since state was cleared
+	resp := sendAndRead(t, reader, conn, "a6 UID EXPUNGE 1:3")
+	if !strings.Contains(resp, "a6 NO") {
+		t.Errorf("UID EXPUNGE should be blocked after mailbox switch (state cleared), got: %s", resp)
+	}
+}
+
+func TestDenyUnlessCopiedNoUIDPLUS(t *testing.T) {
+	rules := testDenyUnlessCopiedRules()
+	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, false) // no COPYUID support
+
+	reader, conn := connect(t)
+	defer conn.Close()
+
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
+
+	// UID COPY succeeds but server doesn't return COPYUID
+	sendAndRead(t, reader, conn, "a3 UID COPY 1:3 Archive")
+
+	// UID EXPUNGE — should be blocked since no COPYUID was received
+	resp := sendAndRead(t, reader, conn, "a4 UID EXPUNGE 1:3")
+	if !strings.Contains(resp, "a4 NO") {
+		t.Errorf("UID EXPUNGE should be blocked when server doesn't support UIDPLUS, got: %s", resp)
+	}
+}
+
+func TestDenyUnlessCopiedMove(t *testing.T) {
+	// Use rules that allow MOVE but have deny-unless-copied on EXPUNGE
+	rules := []rule{
+		{
+			mailbox: "*trash*",
+			deny: []denyEntry{
+				{command: "CLOSE"}, {command: "DELETE"},
+				{command: "RENAME"}, {command: "COMPRESS"},
+				{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+			},
+			denyUnlessCopied: []string{"EXPUNGE"},
+		},
+	}
+	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
+
+	reader, conn := connect(t)
+	defer conn.Close()
+
+	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
+	sendAndRead(t, reader, conn, "a2 SELECT Trash")
+
+	// UID MOVE 1:3 — returns COPYUID just like UID COPY
+	resp := sendAndRead(t, reader, conn, "a3 UID MOVE 1:3 Archive")
+	if !strings.Contains(resp, "a3 OK") {
+		t.Fatalf("UID MOVE should succeed, got: %s", resp)
+	}
+
+	// UID EXPUNGE 1:3 — should be allowed since MOVE returned COPYUID
+	resp = sendAndRead(t, reader, conn, "a4 UID EXPUNGE 1:3")
+	if !strings.Contains(resp, "a4 OK") {
+		t.Errorf("UID EXPUNGE should be allowed after UID MOVE with COPYUID, got: %s", resp)
 	}
 }

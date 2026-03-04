@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -126,8 +127,76 @@ func (c *config) buildUpstreamTLSConfig() (*tls.Config, error) {
 
 var reCapStrip = regexp.MustCompile(`(?i)\s+(STARTTLS|LOGINDISABLED)`)
 
+type aclResult int
+
+const (
+	aclAllow           aclResult = iota
+	aclDeny
+	aclDenyUnlessCopied
+)
+
+const maxUIDSetExpansion = 10000
+
 type connState struct {
 	selectedMailbox string
+
+	mu            sync.Mutex
+	pendingCopies map[string]bool  // tags of in-flight COPY/MOVE commands
+	copiedUIDs    map[uint32]bool  // source UIDs confirmed copied (from COPYUID)
+}
+
+func (s *connState) recordPendingCopy(tag string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingCopies == nil {
+		s.pendingCopies = make(map[string]bool)
+	}
+	s.pendingCopies[tag] = true
+}
+
+func (s *connState) resolvePendingCopy(tag string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingCopies == nil {
+		return false
+	}
+	if s.pendingCopies[tag] {
+		delete(s.pendingCopies, tag)
+		return true
+	}
+	return false
+}
+
+func (s *connState) recordCopiedUIDs(uids []uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.copiedUIDs == nil {
+		s.copiedUIDs = make(map[uint32]bool)
+	}
+	for _, uid := range uids {
+		s.copiedUIDs[uid] = true
+	}
+}
+
+func (s *connState) allUIDsCopied(uids []uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(uids) == 0 || s.copiedUIDs == nil {
+		return false
+	}
+	for _, uid := range uids {
+		if !s.copiedUIDs[uid] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *connState) resetCopyState() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingCopies = nil
+	s.copiedUIDs = nil
 }
 
 // ── ACL types ──
@@ -139,8 +208,9 @@ type denyEntry struct {
 }
 
 type rule struct {
-	mailbox string // glob pattern (case-insensitive matching)
-	deny    []denyEntry
+	mailbox          string // glob pattern (case-insensitive matching)
+	deny             []denyEntry
+	denyUnlessCopied []string // normalized to uppercase; only "EXPUNGE" valid
 }
 
 type yamlConfig struct {
@@ -148,8 +218,9 @@ type yamlConfig struct {
 }
 
 type yamlRule struct {
-	Mailbox string   `yaml:"mailbox"`
-	Deny    []string `yaml:"deny"`
+	Mailbox          string   `yaml:"mailbox"`
+	Deny             []string `yaml:"deny"`
+	DenyUnlessCopied []string `yaml:"deny-unless-copied"`
 }
 
 // ── Glob matcher ──
@@ -226,10 +297,32 @@ func loadACLConfig(path string) ([]rule, error) {
 			}
 			r.deny = append(r.deny, entry)
 		}
+
+		// Parse deny-unless-copied entries
+		denySet := make(map[string]bool)
+		for _, d := range r.deny {
+			denySet[d.command] = true
+		}
+		for _, duc := range yr.DenyUnlessCopied {
+			cmd := strings.ToUpper(strings.TrimSpace(duc))
+			if cmd != "EXPUNGE" {
+				return nil, fmt.Errorf("rule %d: deny-unless-copied only supports EXPUNGE, got %q", i, duc)
+			}
+			if denySet[cmd] {
+				return nil, fmt.Errorf("rule %d: %q appears in both deny and deny-unless-copied", i, cmd)
+			}
+			r.denyUnlessCopied = append(r.denyUnlessCopied, cmd)
+		}
+
 		rules = append(rules, r)
 	}
 
 	return rules, nil
+}
+
+var validDenyCommands = map[string]bool{
+	"EXPUNGE": true, "CLOSE": true, "DELETE": true,
+	"RENAME": true, "MOVE": true, "STORE": true, "COMPRESS": true,
 }
 
 // parseDenyEntry parses a deny string like "EXPUNGE", "STORE", "STORE +\Deleted", "STORE -\Seen".
@@ -242,11 +335,7 @@ func parseDenyEntry(s string) (denyEntry, error) {
 	parts := strings.SplitN(s, " ", 2)
 	cmd := strings.ToUpper(parts[0])
 
-	validCommands := map[string]bool{
-		"EXPUNGE": true, "CLOSE": true, "DELETE": true,
-		"RENAME": true, "MOVE": true, "STORE": true, "COMPRESS": true,
-	}
-	if !validCommands[cmd] {
+	if !validDenyCommands[cmd] {
 		return denyEntry{}, fmt.Errorf("invalid deny command %q", cmd)
 	}
 
@@ -318,9 +407,9 @@ func parseStoreArgs(args string) (op, flags string) {
 
 // ── Rule evaluation ──
 
-func (r *rule) matches(mailbox, cmd string, storeOp, storeFlags string) (bool, string) {
+func (r *rule) matches(mailbox, cmd string, storeOp, storeFlags string) (aclResult, string) {
 	if !globMatch(r.mailbox, mailbox) {
-		return false, ""
+		return aclAllow, ""
 	}
 
 	for _, d := range r.deny {
@@ -330,45 +419,50 @@ func (r *rule) matches(mailbox, cmd string, storeOp, storeFlags string) (bool, s
 
 		if d.command != "STORE" {
 			desc := fmt.Sprintf("mailbox=%q deny=%s", r.mailbox, d.command)
-			return true, desc
+			return aclDeny, desc
 		}
 
 		// STORE with no qualifier: blocks all STORE
 		if d.storeOp == "" && d.storeFlag == "" {
 			desc := fmt.Sprintf("mailbox=%q deny=STORE", r.mailbox)
-			return true, desc
+			return aclDeny, desc
 		}
 
 		// Check STORE op and flag
-		if d.storeOp == "+" && (storeOp == "+" || storeOp == "") {
-			// Rule blocks +flag: matches +FLAGS and bare FLAGS (which replaces)
-			// But storeOp from parseStoreArgs returns "+" for both
-			if storeOp == "+" && strings.Contains(storeFlags, d.storeFlag) {
-				desc := fmt.Sprintf("mailbox=%q deny=STORE %s%s", r.mailbox, d.storeOp, d.storeFlag)
-				return true, desc
-			}
+		// +flag rules match both +FLAGS and bare FLAGS (parseStoreArgs returns "+" for both)
+		if d.storeOp == "+" && storeOp == "+" && strings.Contains(storeFlags, d.storeFlag) {
+			desc := fmt.Sprintf("mailbox=%q deny=STORE %s%s", r.mailbox, d.storeOp, d.storeFlag)
+			return aclDeny, desc
 		}
 		if d.storeOp == "-" && storeOp == "-" && strings.Contains(storeFlags, d.storeFlag) {
 			desc := fmt.Sprintf("mailbox=%q deny=STORE %s%s", r.mailbox, d.storeOp, d.storeFlag)
-			return true, desc
+			return aclDeny, desc
 		}
 	}
 
-	return false, ""
+	// Check deny-unless-copied entries
+	for _, duc := range r.denyUnlessCopied {
+		if duc == cmd {
+			desc := fmt.Sprintf("mailbox=%q deny-unless-copied=%s", r.mailbox, duc)
+			return aclDenyUnlessCopied, desc
+		}
+	}
+
+	return aclAllow, ""
 }
 
-func evalACL(rules []rule, mailbox, cmd string, storeOp, storeFlags string) (bool, string) {
+func evalACL(rules []rule, mailbox, cmd string, storeOp, storeFlags string) (aclResult, string) {
 	if len(rules) == 0 {
-		return false, ""
+		return aclAllow, ""
 	}
 
 	for i := range rules {
-		if blocked, desc := rules[i].matches(mailbox, cmd, storeOp, storeFlags); blocked {
-			return true, fmt.Sprintf("rule[%d]: %s", i, desc)
+		if result, desc := rules[i].matches(mailbox, cmd, storeOp, storeFlags); result != aclAllow {
+			return result, fmt.Sprintf("rule[%d]: %s", i, desc)
 		}
 	}
 
-	return false, ""
+	return aclAllow, ""
 }
 
 func main() {
@@ -458,7 +552,7 @@ func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string)
 	done := make(chan struct{}, 2)
 
 	go func() {
-		relayServerToClient(upstreamReader, clientConn, connID, stripCapsRelay)
+		relayServerToClient(upstreamReader, clientConn, state, connID, stripCapsRelay)
 		done <- struct{}{}
 	}()
 
@@ -595,11 +689,27 @@ func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, st
 					}
 					mailbox = strings.TrimRight(string(litBuf), "\r\n")
 					state.selectedMailbox = mailbox
-						continue
+					state.resetCopyState()
+					// Literal path: already forwarded above, skip normal forwarding
+					continue
 				}
 			}
 			if mailbox != "" {
 				state.selectedMailbox = mailbox
+				state.resetCopyState()
+			}
+		}
+
+		// Track COPY/MOVE/UID COPY/UID MOVE commands for deny-unless-copied
+		if cmd == "COPY" || cmd == "MOVE" {
+			state.recordPendingCopy(tag)
+		} else if cmd == "UID" {
+			subParts := strings.SplitN(args, " ", 2)
+			if len(subParts) > 0 {
+				subCmd := strings.ToUpper(subParts[0])
+				if subCmd == "COPY" || subCmd == "MOVE" {
+					state.recordPendingCopy(tag)
+				}
 			}
 		}
 
@@ -627,7 +737,7 @@ func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, st
 	}
 }
 
-func relayServerToClient(upstream *bufio.Reader, clientConn net.Conn, connID string, stripCapabilities bool) {
+func relayServerToClient(upstream *bufio.Reader, clientConn net.Conn, state *connState, connID string, stripCapabilities bool) {
 	for {
 		line, err := upstream.ReadString('\n')
 		if err != nil {
@@ -636,6 +746,20 @@ func relayServerToClient(upstream *bufio.Reader, clientConn net.Conn, connID str
 
 		if stripCapabilities {
 			line = stripCaps(line)
+		}
+
+		// Track COPYUID responses for deny-unless-copied
+		if tag, rest := parseTaggedResponse(line); tag != "" {
+			if state.resolvePendingCopy(tag) {
+				// This is a response to a COPY/MOVE command we tracked
+				upper := strings.ToUpper(rest)
+				if strings.HasPrefix(upper, "OK") {
+					if uids, ok := parseCOPYUID(line); ok {
+						state.recordCopiedUIDs(uids)
+					}
+				}
+				// NO/BAD: copy failed, no UIDs recorded
+			}
 		}
 
 		if _, err := clientConn.Write([]byte(line)); err != nil {
@@ -708,13 +832,15 @@ func shouldBlock(cmd, args string, state *connState, rules []rule) (bool, string
 		if mailbox == "" {
 			return false, ""
 		}
-		return evalACL(rules, mailbox, "DELETE", "", "")
+		result, desc := evalACL(rules, mailbox, "DELETE", "", "")
+		return result != aclAllow, desc
 	case "RENAME":
 		mailbox := extractMailbox(args)
 		if mailbox == "" {
 			return false, ""
 		}
-		return evalACL(rules, mailbox, "RENAME", "", "")
+		result, desc := evalACL(rules, mailbox, "RENAME", "", "")
+		return result != aclAllow, desc
 	}
 
 	mailbox := state.selectedMailbox
@@ -723,11 +849,20 @@ func shouldBlock(cmd, args string, state *connState, rules []rule) (bool, string
 	}
 
 	switch cmd {
-	case "EXPUNGE", "CLOSE", "MOVE", "COMPRESS":
-		return evalACL(rules, mailbox, cmd, "", "")
+	case "EXPUNGE":
+		result, desc := evalACL(rules, mailbox, "EXPUNGE", "", "")
+		if result == aclDenyUnlessCopied {
+			// Plain EXPUNGE affects all \Deleted messages — can't verify which UIDs
+			return true, desc
+		}
+		return result == aclDeny, desc
+	case "CLOSE", "MOVE", "COMPRESS":
+		result, desc := evalACL(rules, mailbox, cmd, "", "")
+		return result != aclAllow, desc
 	case "STORE":
 		op, flags := parseStoreArgs(args)
-		return evalACL(rules, mailbox, "STORE", op, flags)
+		result, desc := evalACL(rules, mailbox, "STORE", op, flags)
+		return result != aclAllow, desc
 	case "UID":
 		subParts := strings.SplitN(args, " ", 2)
 		if len(subParts) == 0 {
@@ -735,12 +870,35 @@ func shouldBlock(cmd, args string, state *connState, rules []rule) (bool, string
 		}
 		subCmd := strings.ToUpper(subParts[0])
 		switch subCmd {
-		case "EXPUNGE", "MOVE":
-			return evalACL(rules, mailbox, subCmd, "", "")
+		case "EXPUNGE":
+			result, desc := evalACL(rules, mailbox, "EXPUNGE", "", "")
+			if result == aclDeny {
+				return true, desc
+			}
+			if result == aclDenyUnlessCopied {
+				// UID EXPUNGE <uid-set>: check if all UIDs have been copied
+				if len(subParts) < 2 {
+					return true, desc
+				}
+				uidSetStr := strings.TrimSpace(subParts[1])
+				uids, ok := parseUIDSet(uidSetStr)
+				if !ok {
+					return true, desc // unparseable or too large → block
+				}
+				if state.allUIDsCopied(uids) {
+					return false, ""
+				}
+				return true, desc
+			}
+			return false, ""
+		case "MOVE":
+			result, desc := evalACL(rules, mailbox, "MOVE", "", "")
+			return result != aclAllow, desc
 		case "STORE":
 			if len(subParts) > 1 {
 				op, flags := parseStoreArgs(subParts[1])
-				return evalACL(rules, mailbox, "STORE", op, flags)
+				result, desc := evalACL(rules, mailbox, "STORE", op, flags)
+				return result != aclAllow, desc
 			}
 		}
 	}
@@ -778,4 +936,93 @@ func parseLiteral(line string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// ── UID set and COPYUID parsing ──
+
+// parseUIDSet expands UID set syntax (e.g. "1", "1:5", "1,3:5") into individual UIDs.
+// Returns (nil, false) for "*", ranges exceeding maxUIDSetExpansion, or parse errors.
+func parseUIDSet(s string) ([]uint32, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.Contains(s, "*") {
+		return nil, false
+	}
+
+	var result []uint32
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, false
+		}
+		if idx := strings.IndexByte(part, ':'); idx >= 0 {
+			lo, err := strconv.ParseUint(part[:idx], 10, 32)
+			if err != nil || lo == 0 {
+				return nil, false
+			}
+			hi, err := strconv.ParseUint(part[idx+1:], 10, 32)
+			if err != nil || hi == 0 {
+				return nil, false
+			}
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			count := hi - lo + 1
+			if count > maxUIDSetExpansion || len(result)+int(count) > maxUIDSetExpansion {
+				return nil, false
+			}
+			for uid := lo; uid <= hi; uid++ {
+				result = append(result, uint32(uid))
+			}
+		} else {
+			uid, err := strconv.ParseUint(part, 10, 32)
+			if err != nil || uid == 0 {
+				return nil, false
+			}
+			if len(result)+1 > maxUIDSetExpansion {
+				return nil, false
+			}
+			result = append(result, uint32(uid))
+		}
+	}
+	return result, len(result) > 0
+}
+
+// parseCOPYUID extracts source UIDs from a COPYUID response code in a tagged OK line.
+// Format: tag OK [COPYUID <uidvalidity> <source-uids> <dest-uids>] ...
+// Returns the expanded source UIDs and true on success.
+func parseCOPYUID(line string) ([]uint32, bool) {
+	upper := strings.ToUpper(line)
+	idx := strings.Index(upper, "[COPYUID ")
+	if idx < 0 {
+		return nil, false
+	}
+	// Find the closing ]
+	rest := line[idx+len("[COPYUID "):]
+	closeBracket := strings.IndexByte(rest, ']')
+	if closeBracket < 0 {
+		return nil, false
+	}
+	// Fields: <uidvalidity> <source-uids> <dest-uids>
+	fields := strings.Fields(rest[:closeBracket])
+	if len(fields) != 3 {
+		return nil, false
+	}
+	return parseUIDSet(fields[1])
+}
+
+// parseTaggedResponse extracts the tag from a server response line.
+// Returns ("", "") for untagged (*) and continuation (+) lines.
+func parseTaggedResponse(line string) (tag, rest string) {
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		return "", ""
+	}
+	if line[0] == '*' || line[0] == '+' {
+		return "", ""
+	}
+	idx := strings.IndexByte(line, ' ')
+	if idx < 0 {
+		return line, ""
+	}
+	return line[:idx], line[idx+1:]
 }

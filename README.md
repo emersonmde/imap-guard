@@ -38,7 +38,8 @@ Without a config file (`IMAP_GUARD_CONFIG` unset), imap-guard is a pure pass-thr
 # imap-guard.yaml
 rules:
   - mailbox: "*trash*"
-    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+    deny: [CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+    deny-unless-copied: [EXPUNGE]
   - mailbox: "*drafts*"
     deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
   - mailbox: "*junk*"
@@ -49,7 +50,7 @@ rules:
 IMAP_GUARD_CONFIG=imap-guard.yaml imap-guard
 ```
 
-Rules are evaluated in order — first match wins. If no rule matches a command, it passes through.
+Rules are evaluated in order — the first rule whose mailbox pattern matches is used, and the command is blocked only if it appears in that rule's deny list. If no rule matches, the command passes through.
 
 #### Deny entry syntax
 
@@ -61,13 +62,33 @@ Rules are evaluated in order — first match wins. If no rule matches a command,
 | `RENAME` | Block RENAME (moves mailbox out of scope) |
 | `MOVE` | Block MOVE and UID MOVE |
 | `COMPRESS` | Block COMPRESS DEFLATE |
-| `STORE` | Block all STORE commands |
-| `"STORE +\Deleted"` | Block STORE when adding `\Deleted` flag (+FLAGS or FLAGS) |
-| `"STORE -\Seen"` | Block STORE when removing `\Seen` flag (-FLAGS) |
+| `STORE` | Block all STORE and UID STORE commands |
+| `"STORE +\\Deleted"` | Block STORE/UID STORE when adding `\Deleted` flag (+FLAGS or FLAGS) |
+| `"STORE -\\Seen"` | Block STORE/UID STORE when removing `\Seen` flag (-FLAGS) |
 
 Commands not in the deny list pass through. All other IMAP commands (COPY, FETCH, SEARCH, NOOP, etc.) are never blocked.
 
 DELETE and RENAME are evaluated against the target mailbox name from the command arguments (not the currently selected mailbox). All other commands are evaluated against the currently selected mailbox.
+
+#### Conditional deny: `deny-unless-copied`
+
+The `deny-unless-copied` action allows `UID EXPUNGE` only when all targeted UIDs have been confirmed copied via a prior `COPY`, `UID COPY`, or `UID MOVE` command in the same session and mailbox. This enables safe "copy then expunge" workflows while still blocking unprotected deletions.
+
+```yaml
+rules:
+  - mailbox: "*trash*"
+    deny: [CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+    deny-unless-copied: [EXPUNGE]
+```
+
+Behavior:
+- **`UID EXPUNGE <uid-set>`**: Allowed if every UID in the set was previously copied. Blocked otherwise.
+- **Plain `EXPUNGE`**: Always blocked (affects all `\Deleted` messages — the proxy can't verify which UIDs are targeted).
+- **No UIDPLUS support**: If the upstream server doesn't include `[COPYUID ...]` in its COPY/MOVE response (RFC 4315), the proxy blocks conservatively.
+- **State resets on `SELECT`/`EXAMINE`**: Copied UID tracking is per-mailbox; switching mailboxes clears the state.
+- **UID set cap**: UID set expansion is capped at 10,000 UIDs. A `UID EXPUNGE` targeting more than 10,000 UIDs is blocked.
+
+Only `EXPUNGE` is valid in `deny-unless-copied`. A command cannot appear in both `deny` and `deny-unless-copied` within the same rule (the config loader rejects overlaps at startup).
 
 #### Glob patterns
 
@@ -80,11 +101,20 @@ Mailbox patterns support `*` (matches any characters, including hierarchy separa
 | `INBOX.*` | `INBOX.Sent`, `INBOX.Drafts` |
 | `*` | All mailboxes |
 
-### Migrating from v0.3
+### Migrating from v0.4
 
-v0.3 had hardcoded protection for mailboxes containing "trash", "drafts", or "junk". v0.4 replaces this with configurable ACL rules. **This is a breaking change** — without a config file, no commands are blocked.
+v0.5 adds `deny-unless-copied` as a new ACL action. Existing configs with only `deny` rules continue to work unchanged. To use conditional EXPUNGE protection, move `EXPUNGE` from `deny` to `deny-unless-copied`. Note: a command cannot appear in both `deny` and `deny-unless-copied` within the same rule — the config loader will reject the overlap at startup.
 
-To restore v0.3 behavior, create a config file with the example YAML above and set `IMAP_GUARD_CONFIG` to its path.
+```yaml
+# Before (v0.4): EXPUNGE unconditionally blocked
+- mailbox: "*trash*"
+  deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+
+# After (v0.5): EXPUNGE allowed after COPY
+- mailbox: "*trash*"
+  deny: [CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+  deny-unless-copied: [EXPUNGE]
+```
 
 ## Usage
 

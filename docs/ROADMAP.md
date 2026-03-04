@@ -1,5 +1,7 @@
 # imap-guard Development Roadmap
 
+Current version: **v0.5**
+
 ## Design Principles
 
 - **Thin proxy**: minimal overhead, pass everything through unless a rule says otherwise
@@ -9,7 +11,7 @@
 
 ---
 
-## v0.1 — Current State
+## v0.1 — Initial Release
 
 Single-file IMAP proxy with hardcoded protections.
 
@@ -19,20 +21,20 @@ Single-file IMAP proxy with hardcoded protections.
 - Blocks EXPUNGE and STORE +\Deleted on hardcoded Trash/Drafts mailboxes
 - Full test suite with mock upstream server
 
-### Known Issues
+### Known Issues (all addressed in v0.2–v0.4)
 
-- `InsecureSkipVerify: true` is hardcoded with no option for real cert verification
-- Upstream connection mode is hardcoded to STARTTLS (no plaintext or implicit TLS)
-- `stripCaps` runs on all server traffic including message bodies — will corrupt emails containing "STARTTLS" in the body text
-- `CLOSE` command is not blocked but implicitly expunges all \Deleted messages (protection bypass)
-- `DELETE` command is not blocked — can destroy an entire protected mailbox and all its contents
-- `RENAME` command is not blocked — can rename a protected mailbox to an unprotected name, bypassing all rules
-- `MOVE` from a protected mailbox is not blocked — can relocate messages to an unprotected mailbox where they can then be deleted
-- `COMPRESS` extension (RFC 4978) is not handled — if negotiated, all subsequent traffic is opaque to the proxy and ACLs become unenforceable
-- Literal mailbox names (`SELECT {5}\r\nTrash`) bypass protection entirely
-- Protected mailbox list is hardcoded, not configurable
-- Default listen port is `:144` (not standard IMAP port 143, requires root)
-- Blocked response write errors are silently ignored
+- `InsecureSkipVerify: true` is hardcoded with no option for real cert verification → *fixed in v0.3*
+- Upstream connection mode is hardcoded to STARTTLS (no plaintext or implicit TLS) → *fixed in v0.3*
+- `stripCaps` runs on all server traffic including message bodies → *fixed in v0.2*
+- `CLOSE` command is not blocked but implicitly expunges → *fixed in v0.4 ACL system*
+- `DELETE` command is not blocked → *fixed in v0.4 ACL system*
+- `RENAME` command is not blocked → *fixed in v0.4 ACL system*
+- `MOVE` from a protected mailbox is not blocked → *fixed in v0.4 ACL system*
+- `COMPRESS` extension (RFC 4978) is not handled → *fixed in v0.4 ACL system (blocked via deny rules)*
+- Literal mailbox names (`SELECT {5}\r\nTrash`) bypass protection entirely → *fixed in v0.2 (conservative literal handling)*
+- Protected mailbox list is hardcoded, not configurable → *fixed in v0.4 ACL system*
+- Default listen port is `:144` (not standard IMAP port 143, requires root) → *fixed in v0.3*
+- Blocked response write errors are silently ignored → *fixed in v0.2*
 - Test goroutines call `t.Errorf` from background goroutines (panics on Go 1.24+)
 
 ---
@@ -41,17 +43,17 @@ Single-file IMAP proxy with hardcoded protections.
 
 Fix correctness issues found in code review.
 
-- [ ] Only apply `stripCaps` to CAPABILITY response lines (lines starting with `* CAPABILITY` or containing `[CAPABILITY ...`), not message body data
-- [ ] Block `CLOSE` on protected mailboxes (it implicitly expunges)
-- [ ] Block `DELETE` on protected mailboxes (destroys entire mailbox)
-- [ ] Block `RENAME` on protected mailboxes (moves mailbox out of protection scope)
-- [ ] Block `MOVE` from protected mailboxes by default (relocates messages to unprotected mailbox)
-- [ ] Block `COMPRESS` negotiation (RFC 4978) — if compressed, the proxy can no longer parse traffic and all ACLs are bypassed
-- [ ] Handle literal mailbox names in SELECT/EXAMINE, or conservatively block literal-form SELECT on protected mailboxes
-- [ ] Check error return from `clientConn.Write` when sending blocked responses
-- [ ] Change default listen port from `:144` to `:1143` or another non-privileged port
+- [x] Only apply `stripCaps` to CAPABILITY response lines (lines starting with `* CAPABILITY` or containing `[CAPABILITY ...`), not message body data
+- [x] Block `CLOSE` on protected mailboxes (it implicitly expunges) — *moved to v0.4 ACL system*
+- [x] Block `DELETE` on protected mailboxes (destroys entire mailbox) — *moved to v0.4 ACL system*
+- [x] Block `RENAME` on protected mailboxes (moves mailbox out of protection scope) — *moved to v0.4 ACL system*
+- [x] Block `MOVE` from protected mailboxes by default (relocates messages to unprotected mailbox) — *moved to v0.4 ACL system*
+- [x] Block `COMPRESS` negotiation (RFC 4978) — *moved to v0.4 ACL system (deny rules)*
+- [x] Handle literal mailbox names in SELECT/EXAMINE, or conservatively block literal-form SELECT on protected mailboxes
+- [x] Check error return from `clientConn.Write` when sending blocked responses
+- [x] Change default listen port from `:144` to `:1143` or another non-privileged port — *done in v0.3*
 - [ ] Fix test goroutine lifecycle: don't call `t.Errorf` from background goroutines, add `sync.WaitGroup` to track proxy goroutines
-- [ ] Fix `generateTestCert` to propagate errors via `testing.T`
+- [x] Fix `generateTestCert` to propagate errors via `testing.T`
 - [ ] Replace racy `time.Sleep` in tests with deterministic synchronization
 
 ---
@@ -133,47 +135,45 @@ Config is loaded at startup. Users restart to pick up changes. SIGHUP reload def
 - [x] Support config file path via `IMAP_GUARD_CONFIG` env var
 - [x] When no config file is present, proxy is fully pass-through (no blocking)
 - [x] Log which rule matched when blocking a command
-- [ ] Support COMPRESS DEFLATE (RFC 4978): intercept negotiation, wrap both sides with `compress/flate`, continue ACL evaluation on decompressed stream (deferred to v0.5+)
 
 ---
 
-## v0.5 — Workflow Tracking
+## v0.5 — Workflow Tracking (deny-unless-copied)
 
-Track multi-command sequences to make smarter allow/deny decisions.
+Track COPY/MOVE commands to allow safe EXPUNGE workflows.
 
 ### Problem
 
-The current approach blocks all EXPUNGE in protected mailboxes. But some workflows involving EXPUNGE are safe:
+The v0.4 approach blocks all EXPUNGE in protected mailboxes. But some workflows are safe:
 
-- `MOVE 1 INBOX` in Trash — message is relocated, server handles expunge internally (already works, MOVE is atomic per RFC 6851)
-- `COPY 1 Archive` then `EXPUNGE` in Trash — message has a safe copy, expunge just cleans up
-
-Other workflows are destructive:
-
-- `EXPUNGE` in Trash with no prior COPY/MOVE — permanent deletion
-- `STORE +\Deleted` on all messages, then `CLOSE` — permanent deletion
+- `UID COPY 1:3 Archive` then `UID EXPUNGE 1:3` in Trash — messages have a safe copy
 
 ### Design
 
-Per-connection state tracking:
+- New ACL action `deny-unless-copied`: allows `UID EXPUNGE` when all targeted UIDs have been confirmed copied via COPYUID responses (RFC 4315) from prior COPY/UID COPY/UID MOVE commands
+- Plain `EXPUNGE` is always blocked under `deny-unless-copied` (can't verify which UIDs are affected)
+- Tag correlation: `relayClientToServer` records pending COPY tags, `relayServerToClient` resolves them against COPYUID responses
+- State resets on SELECT/EXAMINE (copied UIDs are mailbox-specific)
+- UID set expansion capped at 10,000 to prevent memory exhaustion
+- Conservative: if server doesn't support UIDPLUS (no COPYUID in response), block
 
-- Track which message UIDs/sequences have been copied or moved out of the current mailbox
-- When EXPUNGE is requested, only allow it if all \Deleted messages have been copied/moved elsewhere
-- Conservative default: if we can't determine safety, block
+### Deferred from original spec
 
-This requires parsing COPY/MOVE responses to know which messages were affected, and correlating with STORE \Deleted flags.
+- \Deleted flag tracking — not needed; UID EXPUNGE doesn't require it
+- Sequence number → UID mapping — not needed; COPYUID gives source UIDs directly
+- `deny-unless-copied` for CLOSE — CLOSE always blocked (same pre-existing \Deleted problem as plain EXPUNGE)
 
 ### Tasks
 
-- [ ] Track COPY/MOVE commands and their target mailboxes per connection
-- [ ] Track which messages have \Deleted flag set (from STORE responses or FETCH)
-- [ ] Implement "safe expunge" check: all \Deleted messages have a copy elsewhere
-- [ ] Add ACL action: `deny-unless-copied` for EXPUNGE (in addition to hard `deny`)
-- [ ] Handle UID vs sequence number mapping (server sends EXPUNGE with sequence numbers)
-
-### Complexity Warning
-
-This is the most complex milestone. IMAP message tracking across commands is stateful and error-prone — sequence numbers shift after every EXPUNGE, UID validity can change on SELECT, and concurrent clients can modify the mailbox state. Start with a conservative implementation that blocks when uncertain.
+- [x] Add `deny-unless-copied` ACL action (only valid for EXPUNGE)
+- [x] Track COPY/UID COPY/UID MOVE commands via tag correlation
+- [x] Parse COPYUID responses from server to record source UIDs
+- [x] Allow UID EXPUNGE when all UIDs in the set have been copied
+- [x] Block plain EXPUNGE unconditionally under deny-unless-copied
+- [x] Reset copy state on SELECT/EXAMINE
+- [x] Config validation: no overlap between deny and deny-unless-copied
+- [x] Unit tests for parseUIDSet, parseCOPYUID, parseTaggedResponse, connState methods
+- [x] Integration tests for full copy-then-expunge workflows
 
 ---
 
@@ -189,6 +189,7 @@ Polish, observability, and operational readiness.
 - [ ] Metrics: active connections, commands proxied, commands blocked (Prometheus endpoint or structured log counters)
 - [ ] Docker image and example docker-compose setup
 - [ ] man page or `--help` with full option documentation
+- [ ] Support COMPRESS DEFLATE (RFC 4978): intercept negotiation, wrap both sides with `compress/flate`, continue ACL evaluation on decompressed stream
 - [ ] CI pipeline (lint, test, build, release binaries)
 
 ---
