@@ -56,11 +56,11 @@ type connState struct {
 	selectedMailbox string
 
 	mu            sync.Mutex
-	pendingCopies map[string]bool  // tags of in-flight COPY/MOVE commands
-	copiedUIDs    map[uint32]bool  // source UIDs confirmed copied (from COPYUID)
+	pendingCopies map[string]bool // tags of in-flight COPY/MOVE commands
+	copiedUIDs    map[uint32]bool // source UIDs confirmed copied (from COPYUID)
 
 	// COMPRESS DEFLATE coordination
-	compressTag    atomic.Value     // stores string tag when COMPRESS is in-flight
+	compressTag    atomic.Value      // stores string tag when COMPRESS is in-flight
 	compressRespCh chan string       // server response line (server→client sends back to client→server)
 	compressDoneCh chan compressDone // completion signal with new streams
 }
@@ -122,14 +122,14 @@ func (s *connState) resetCopyState() {
 func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string, m *metrics) {
 	// activeConns is incremented by the accept loop before spawning this goroutine
 	defer m.activeConns.Add(-1)
-	defer clientConn.Close()
+	defer func() { _ = clientConn.Close() }()
 
 	upstreamConn, greeting, err := connectToUpstream(cfg)
 	if err != nil {
 		slog.Error("upstream connect failed", "conn", connID, "err", err)
 		return
 	}
-	defer upstreamConn.Close()
+	defer func() { _ = upstreamConn.Close() }()
 
 	// Strip capabilities when proxy terminates TLS (client connects plaintext)
 	if cfg.shouldStripCaps() {
@@ -142,8 +142,8 @@ func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string,
 
 	sessionDeadline := time.Now().Add(cfg.sessionTimeout)
 	// Set write deadline to session max; read deadlines are managed by resetDeadline
-	clientConn.SetWriteDeadline(sessionDeadline)
-	upstreamConn.SetWriteDeadline(sessionDeadline)
+	_ = clientConn.SetWriteDeadline(sessionDeadline)
+	_ = upstreamConn.SetWriteDeadline(sessionDeadline)
 
 	state := &connState{
 		compressRespCh: make(chan string, 1),
@@ -171,11 +171,11 @@ func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string,
 		done <- struct{}{}
 	}()
 
-	<-done          // first goroutine exits
-	cancel()        // unblock channel waits in the other goroutine
-	clientConn.Close()
-	upstreamConn.Close()
-	<-done          // second goroutine exits cleanly
+	<-done   // first goroutine exits
+	cancel() // unblock channel waits in the other goroutine
+	_ = clientConn.Close()
+	_ = upstreamConn.Close()
+	<-done // second goroutine exits cleanly
 
 	slog.Info("connection closed", "conn", connID)
 }
@@ -201,7 +201,7 @@ func connectUpstreamPlaintext(addr string) (net.Conn, string, error) {
 
 	greeting, err := readLine(bufio.NewReaderSize(conn, 8192), maxLineLength)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", fmt.Errorf("read greeting: %w", err)
 	}
 
@@ -218,33 +218,33 @@ func connectUpstreamSTARTTLS(cfg *config) (net.Conn, string, error) {
 
 	greeting, err := readLine(reader, maxLineLength)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", fmt.Errorf("read greeting: %w", err)
 	}
 
 	if _, err := fmt.Fprintf(conn, "proxy0 STARTTLS\r\n"); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", fmt.Errorf("send STARTTLS: %w", err)
 	}
 
 	resp, err := readLine(reader, maxLineLength)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", fmt.Errorf("read STARTTLS response: %w", err)
 	}
 	if !strings.HasPrefix(resp, "proxy0 OK") {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", fmt.Errorf("STARTTLS rejected: %s", strings.TrimSpace(resp))
 	}
 
 	tlsCfg, err := cfg.buildUpstreamTLSConfig()
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", err
 	}
 	tlsConn := tls.Client(conn, tlsCfg)
 	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", fmt.Errorf("TLS handshake: %w", err)
 	}
 
@@ -264,7 +264,7 @@ func connectUpstreamTLS(cfg *config) (net.Conn, string, error) {
 
 	greeting, err := readLine(bufio.NewReaderSize(conn, 8192), maxLineLength)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", fmt.Errorf("read greeting: %w", err)
 	}
 
@@ -276,7 +276,7 @@ func resetDeadline(conn net.Conn, idleTimeout time.Duration, sessionDeadline tim
 	if deadline.After(sessionDeadline) {
 		deadline = sessionDeadline
 	}
-	conn.SetReadDeadline(deadline)
+	_ = conn.SetReadDeadline(deadline)
 }
 
 func relayClientToServer(ctx context.Context, clientReader *bufio.Reader, clientConn net.Conn,
@@ -438,9 +438,10 @@ func relayClientToServer(ctx context.Context, clientReader *bufio.Reader, client
 		}
 
 		// Track COPY/MOVE/UID COPY/UID MOVE commands for deny-unless-copied
-		if cmd == "COPY" || cmd == "MOVE" {
+		switch cmd {
+		case "COPY", "MOVE":
 			state.recordPendingCopy(tag)
-		} else if cmd == "UID" {
+		case "UID":
 			subParts := strings.SplitN(args, " ", 2)
 			if len(subParts) > 0 {
 				subCmd := strings.ToUpper(subParts[0])

@@ -22,7 +22,7 @@ import (
 type upstreamTLSMode int
 
 const (
-	upstreamPlaintext  upstreamTLSMode = iota
+	upstreamPlaintext upstreamTLSMode = iota
 	upstreamSTARTTLS
 	upstreamImplicitTLS
 )
@@ -196,11 +196,11 @@ func startHealthServer(addr string, m *metrics) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "ok")
+		_, _ = fmt.Fprintln(w, "ok")
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int64{
+		_ = json.NewEncoder(w).Encode(map[string]int64{
 			"active_connections":     m.activeConns.Load(),
 			"total_commands_proxied": m.totalProxied.Load(),
 			"total_commands_blocked": m.totalBlocked.Load(),
@@ -344,7 +344,7 @@ func main() {
 	// Close listener on shutdown signal
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		_ = ln.Close()
 	}()
 
 	// Accept loop
@@ -363,7 +363,7 @@ func main() {
 				"remote", conn.RemoteAddr(),
 				"limit", cfg.maxConnections,
 				"active", m.activeConns.Load())
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		connID := fmt.Sprintf("C%d", atomic.AddUint64(&connCounter, 1))
@@ -399,7 +399,7 @@ func main() {
 	if healthSrv != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		healthSrv.Shutdown(shutdownCtx)
+		_ = healthSrv.Shutdown(shutdownCtx)
 	}
 
 	slog.Info("imap-guard stopped",

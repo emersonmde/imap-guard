@@ -18,7 +18,7 @@ import (
 
 func TestProxyEndToEnd(t *testing.T) {
 	upstream := newMockUpstream(t, mockSTARTTLS)
-	defer upstream.listener.Close()
+	defer func() { _ = upstream.listener.Close() }()
 	go upstream.serve()
 
 	cfg := testConfig(upstream.addr())
@@ -28,7 +28,7 @@ func TestProxyEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	defer proxyLn.Close()
+	defer func() { _ = proxyLn.Close() }()
 
 	go func() {
 		for {
@@ -65,7 +65,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	sendAndRead := func(t *testing.T, reader *bufio.Reader, conn net.Conn, cmd string) string {
 		t.Helper()
-		fmt.Fprintf(conn, "%s\r\n", cmd)
+		_, _ = fmt.Fprintf(conn, "%s\r\n", cmd)
 		tag := strings.SplitN(cmd, " ", 2)[0]
 		var resp strings.Builder
 		for {
@@ -83,12 +83,12 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("greeting_capabilities_stripped", func(t *testing.T) {
 		_, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 	})
 
 	t.Run("login_forwarded", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		resp := sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		if !strings.Contains(resp, "a1 OK") {
 			t.Errorf("LOGIN should succeed, got: %s", resp)
@@ -97,7 +97,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("move_blocked_in_trash", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		resp := sendAndRead(t, reader, conn, "a3 MOVE 5 INBOX")
@@ -108,7 +108,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("close_blocked_in_trash", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		resp := sendAndRead(t, reader, conn, "a3 CLOSE")
@@ -119,7 +119,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("delete_blocked_on_protected_mailbox", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT INBOX")
 		resp := sendAndRead(t, reader, conn, "a3 DELETE Trash")
@@ -130,7 +130,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("rename_blocked_on_protected_mailbox", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT INBOX")
 		resp := sendAndRead(t, reader, conn, "a3 RENAME Drafts TempFolder")
@@ -141,7 +141,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("expunge_blocked_in_trash", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		resp := sendAndRead(t, reader, conn, "a3 EXPUNGE")
@@ -155,7 +155,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("store_deleted_blocked_in_trash", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		resp := sendAndRead(t, reader, conn, "a3 STORE 1:* +FLAGS (\\Deleted)")
@@ -166,7 +166,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("store_seen_allowed_in_trash", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		resp := sendAndRead(t, reader, conn, "a3 STORE 1:* +FLAGS (\\Seen)")
@@ -177,7 +177,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("remove_deleted_allowed_in_trash", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		resp := sendAndRead(t, reader, conn, "a3 STORE 1:* -FLAGS (\\Deleted)")
@@ -188,7 +188,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("expunge_allowed_in_inbox", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT INBOX")
 		resp := sendAndRead(t, reader, conn, "a3 EXPUNGE")
@@ -199,7 +199,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("store_deleted_allowed_in_inbox", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT INBOX")
 		resp := sendAndRead(t, reader, conn, "a3 STORE 1:* +FLAGS (\\Deleted)")
@@ -210,7 +210,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("uid_expunge_blocked_in_drafts", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Drafts")
 		resp := sendAndRead(t, reader, conn, "a3 UID EXPUNGE 100")
@@ -221,7 +221,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("uid_store_deleted_blocked_in_drafts", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Drafts")
 		resp := sendAndRead(t, reader, conn, "a3 UID STORE 100 +FLAGS (\\Deleted)")
@@ -232,7 +232,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("switching_mailbox_updates_protection", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -260,7 +260,7 @@ func TestProxyEndToEnd(t *testing.T) {
 		upstream.mu.Unlock()
 
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT Trash")
 		sendAndRead(t, reader, conn, "a3 EXPUNGE")
@@ -291,9 +291,9 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("literal_mailbox_name_protection", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
-		fmt.Fprintf(conn, "a2 SELECT {5}\r\n")
+		_, _ = fmt.Fprintf(conn, "a2 SELECT {5}\r\n")
 		// Proxy now handles continuation itself
 		contLine, err := reader.ReadString('\n')
 		if err != nil {
@@ -303,7 +303,7 @@ func TestProxyEndToEnd(t *testing.T) {
 			t.Fatalf("expected continuation response, got: %s", contLine)
 		}
 		// Send 5-byte literal "Trash" followed by the command continuation line
-		fmt.Fprintf(conn, "Trash\r\n")
+		_, _ = fmt.Fprintf(conn, "Trash\r\n")
 		tag := "a2"
 		var resp strings.Builder
 		for {
@@ -324,7 +324,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 	t.Run("quoted_mailbox_name", func(t *testing.T) {
 		reader, conn := connect(t)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 		sendAndRead(t, reader, conn, "a2 SELECT \"Trash\"")
 		resp := sendAndRead(t, reader, conn, "a3 EXPUNGE")
@@ -336,7 +336,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 func TestProxyPlaintextUpstream(t *testing.T) {
 	upstream := newMockUpstream(t, mockPlaintext)
-	defer upstream.listener.Close()
+	defer func() { _ = upstream.listener.Close() }()
 	go upstream.serve()
 
 	cfg := &config{
@@ -352,7 +352,7 @@ func TestProxyPlaintextUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	defer proxyLn.Close()
+	defer func() { _ = proxyLn.Close() }()
 
 	go func() {
 		for {
@@ -368,7 +368,7 @@ func TestProxyPlaintextUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
@@ -380,7 +380,7 @@ func TestProxyPlaintextUpstream(t *testing.T) {
 	}
 
 	// Send login and verify relay works
-	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	_, _ = fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
 	tag := "a1"
 	var resp strings.Builder
 	for {
@@ -400,7 +400,7 @@ func TestProxyPlaintextUpstream(t *testing.T) {
 
 func TestProxyImplicitTLSUpstream(t *testing.T) {
 	upstream := newMockUpstream(t, mockImplicitTLS)
-	defer upstream.listener.Close()
+	defer func() { _ = upstream.listener.Close() }()
 	go upstream.serve()
 
 	cfg := &config{
@@ -416,7 +416,7 @@ func TestProxyImplicitTLSUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	defer proxyLn.Close()
+	defer func() { _ = proxyLn.Close() }()
 
 	go func() {
 		for {
@@ -432,7 +432,7 @@ func TestProxyImplicitTLSUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
@@ -444,7 +444,7 @@ func TestProxyImplicitTLSUpstream(t *testing.T) {
 	}
 
 	// Verify relay works through implicit TLS
-	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	_, _ = fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
 	tag := "a1"
 	var resp strings.Builder
 	for {
@@ -464,7 +464,7 @@ func TestProxyImplicitTLSUpstream(t *testing.T) {
 
 func TestProxyClientTLS(t *testing.T) {
 	upstream := newMockUpstream(t, mockSTARTTLS)
-	defer upstream.listener.Close()
+	defer func() { _ = upstream.listener.Close() }()
 	go upstream.serve()
 
 	clientCert := generateTestCert(t)
@@ -492,7 +492,7 @@ func TestProxyClientTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	defer proxyLn.Close()
+	defer func() { _ = proxyLn.Close() }()
 
 	go func() {
 		for {
@@ -514,7 +514,7 @@ func TestProxyClientTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client TLS connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
@@ -537,7 +537,7 @@ func TestCAFileVerification(t *testing.T) {
 
 	serverCert := signServerCert(t, caCertParsed, caPrivKey)
 	upstream := newMockUpstreamWithCert(t, mockImplicitTLS, serverCert)
-	defer upstream.listener.Close()
+	defer func() { _ = upstream.listener.Close() }()
 	go upstream.serve()
 
 	cfg := &config{
@@ -553,7 +553,7 @@ func TestCAFileVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	defer proxyLn.Close()
+	defer func() { _ = proxyLn.Close() }()
 
 	go func() {
 		for {
@@ -569,7 +569,7 @@ func TestCAFileVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
@@ -581,7 +581,7 @@ func TestCAFileVerification(t *testing.T) {
 	}
 
 	// Verify relay works with CA-verified connection
-	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	_, _ = fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
 	tag := "a1"
 	var resp strings.Builder
 	for {
@@ -603,7 +603,7 @@ func TestNoConfigPassThrough(t *testing.T) {
 	_, connect, sendAndRead := startProxy(t, nil) // nil rules = no blocking
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -635,7 +635,7 @@ func TestWildcardRules(t *testing.T) {
 	_, connect, sendAndRead := startProxy(t, wildcardRules)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
@@ -666,7 +666,7 @@ func TestDenyUnlessCopiedWorkflow(t *testing.T) {
 	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -689,7 +689,7 @@ func TestDenyUnlessCopiedBlocked(t *testing.T) {
 	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -706,7 +706,7 @@ func TestDenyUnlessCopiedPartial(t *testing.T) {
 	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -726,7 +726,7 @@ func TestDenyUnlessCopiedPlainExpunge(t *testing.T) {
 	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -746,7 +746,7 @@ func TestDenyUnlessCopiedMailboxSwitch(t *testing.T) {
 	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -770,7 +770,7 @@ func TestDenyUnlessCopiedNoUIDPLUS(t *testing.T) {
 	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, false) // no COPYUID support
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -801,7 +801,7 @@ func TestDenyUnlessCopiedMove(t *testing.T) {
 	_, connect, sendAndRead := startProxyWithCOPYUID(t, rules, true)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT Trash")
@@ -825,7 +825,7 @@ func TestIdleTimeout(t *testing.T) {
 	upstream := newMockUpstream(t, mockSTARTTLS)
 	go upstream.serve()
 	t.Cleanup(func() {
-		upstream.listener.Close()
+		_ = upstream.listener.Close()
 		<-upstream.done
 	})
 
@@ -838,7 +838,7 @@ func TestIdleTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	t.Cleanup(func() { proxyLn.Close() })
+	t.Cleanup(func() { _ = proxyLn.Close() })
 
 	var proxyWg sync.WaitGroup
 	go func() {
@@ -859,7 +859,7 @@ func TestIdleTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	if _, err := reader.ReadString('\n'); err != nil {
@@ -870,7 +870,7 @@ func TestIdleTimeout(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 
 	// Connection should be closed by now
-	conn.SetReadDeadline(time.Now().Add(time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 	_, err = reader.ReadString('\n')
 	if err == nil {
 		t.Error("expected connection to be closed after idle timeout")
@@ -881,7 +881,7 @@ func TestSessionTimeout(t *testing.T) {
 	upstream := newMockUpstream(t, mockSTARTTLS)
 	go upstream.serve()
 	t.Cleanup(func() {
-		upstream.listener.Close()
+		_ = upstream.listener.Close()
 		<-upstream.done
 	})
 
@@ -894,7 +894,7 @@ func TestSessionTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	t.Cleanup(func() { proxyLn.Close() })
+	t.Cleanup(func() { _ = proxyLn.Close() })
 
 	go func() {
 		for {
@@ -910,7 +910,7 @@ func TestSessionTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	if _, err := reader.ReadString('\n'); err != nil {
@@ -920,8 +920,8 @@ func TestSessionTimeout(t *testing.T) {
 	// Keep sending NOOPs to reset idle, but session timeout should still fire
 	for i := 0; i < 10; i++ {
 		time.Sleep(50 * time.Millisecond)
-		fmt.Fprintf(conn, "a%d NOOP\r\n", i)
-		conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = fmt.Fprintf(conn, "a%d NOOP\r\n", i)
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		_, err := reader.ReadString('\n')
 		if err != nil {
 			// Connection closed due to session timeout
@@ -937,7 +937,7 @@ func TestGracefulShutdown(t *testing.T) {
 	upstream := newMockUpstream(t, mockSTARTTLS)
 	go upstream.serve()
 	t.Cleanup(func() {
-		upstream.listener.Close()
+		_ = upstream.listener.Close()
 		<-upstream.done
 	})
 
@@ -954,7 +954,7 @@ func TestGracefulShutdown(t *testing.T) {
 
 	go func() {
 		<-ctx.Done()
-		proxyLn.Close()
+		_ = proxyLn.Close()
 	}()
 
 	go func() {
@@ -986,7 +986,7 @@ func TestGracefulShutdown(t *testing.T) {
 	cancel()
 
 	// Close client connection to let handleClient drain
-	conn.Close()
+	_ = conn.Close()
 
 	// Wait for connections to drain
 	done := make(chan struct{})
@@ -1009,7 +1009,7 @@ func TestCompressDeflateNegotiation(t *testing.T) {
 	upstream := newMockUpstreamWithCompress(t, mockSTARTTLS)
 	go upstream.serve()
 	t.Cleanup(func() {
-		upstream.listener.Close()
+		_ = upstream.listener.Close()
 		<-upstream.done
 	})
 
@@ -1020,7 +1020,7 @@ func TestCompressDeflateNegotiation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	t.Cleanup(func() { proxyLn.Close() })
+	t.Cleanup(func() { _ = proxyLn.Close() })
 
 	go func() {
 		for {
@@ -1036,7 +1036,7 @@ func TestCompressDeflateNegotiation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	if _, err := reader.ReadString('\n'); err != nil {
@@ -1044,11 +1044,11 @@ func TestCompressDeflateNegotiation(t *testing.T) {
 	}
 
 	// Login
-	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	_, _ = fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
 	readTagged(t, reader, "a1")
 
 	// Send COMPRESS DEFLATE
-	fmt.Fprintf(conn, "a2 COMPRESS DEFLATE\r\n")
+	_, _ = fmt.Fprintf(conn, "a2 COMPRESS DEFLATE\r\n")
 	resp := readTagged(t, reader, "a2")
 	if !strings.Contains(resp, "a2 OK") {
 		t.Fatalf("COMPRESS DEFLATE should succeed, got: %s", resp)
@@ -1060,7 +1060,7 @@ func TestCompressDeflateNegotiation(t *testing.T) {
 	compressedReader := bufio.NewReaderSize(flate.NewReader(conn), 8192)
 
 	// Send a command over the compressed stream
-	clientFW.Write([]byte("a3 NOOP\r\n"))
+	_, _ = clientFW.Write([]byte("a3 NOOP\r\n"))
 	compResp := readTagged(t, compressedReader, "a3")
 	if !strings.Contains(compResp, "a3 OK") {
 		t.Errorf("NOOP over compressed stream should succeed, got: %s", compResp)
@@ -1074,7 +1074,7 @@ func TestCompressDeflateBlocked(t *testing.T) {
 	_, connect, sendAndRead := startProxy(t, rules)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 	sendAndRead(t, reader, conn, "a2 SELECT INBOX")
@@ -1096,7 +1096,7 @@ func TestCompressDeflateUpstreamReject(t *testing.T) {
 	_, connect, sendAndRead := startProxy(t, nil)
 
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
@@ -1118,7 +1118,7 @@ func TestCompressDeflateWithACL(t *testing.T) {
 	upstream := newMockUpstreamWithCompress(t, mockSTARTTLS)
 	go upstream.serve()
 	t.Cleanup(func() {
-		upstream.listener.Close()
+		_ = upstream.listener.Close()
 		<-upstream.done
 	})
 
@@ -1129,7 +1129,7 @@ func TestCompressDeflateWithACL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	t.Cleanup(func() { proxyLn.Close() })
+	t.Cleanup(func() { _ = proxyLn.Close() })
 
 	go func() {
 		for {
@@ -1145,7 +1145,7 @@ func TestCompressDeflateWithACL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	if _, err := reader.ReadString('\n'); err != nil {
@@ -1153,13 +1153,13 @@ func TestCompressDeflateWithACL(t *testing.T) {
 	}
 
 	// Login and select non-protected mailbox
-	fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
+	_, _ = fmt.Fprintf(conn, "a1 LOGIN user pass\r\n")
 	readTagged(t, reader, "a1")
-	fmt.Fprintf(conn, "a2 SELECT INBOX\r\n")
+	_, _ = fmt.Fprintf(conn, "a2 SELECT INBOX\r\n")
 	readTagged(t, reader, "a2")
 
 	// Negotiate COMPRESS DEFLATE
-	fmt.Fprintf(conn, "a3 COMPRESS DEFLATE\r\n")
+	_, _ = fmt.Fprintf(conn, "a3 COMPRESS DEFLATE\r\n")
 	resp := readTagged(t, reader, "a3")
 	if !strings.Contains(resp, "a3 OK") {
 		t.Fatalf("COMPRESS DEFLATE should succeed, got: %s", resp)
@@ -1171,11 +1171,11 @@ func TestCompressDeflateWithACL(t *testing.T) {
 	compressedReader := bufio.NewReaderSize(flate.NewReader(conn), 8192)
 
 	// Select Trash over compressed stream
-	clientFW.Write([]byte("a4 SELECT Trash\r\n"))
+	_, _ = clientFW.Write([]byte("a4 SELECT Trash\r\n"))
 	readTagged(t, compressedReader, "a4")
 
 	// EXPUNGE should be blocked even over compressed stream
-	clientFW.Write([]byte("a5 EXPUNGE\r\n"))
+	_, _ = clientFW.Write([]byte("a5 EXPUNGE\r\n"))
 	compResp := readTagged(t, compressedReader, "a5")
 	if !strings.Contains(compResp, "a5 NO") {
 		t.Errorf("EXPUNGE in Trash over compressed stream should be blocked, got: %s", compResp)
@@ -1187,11 +1187,11 @@ func TestCompressDeflateWithACL(t *testing.T) {
 func TestDeleteLiteralBlocked(t *testing.T) {
 	upstream, connect, sendAndRead := startProxy(t, testRules())
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
 	// DELETE Trash using IMAP synchronizing literal
-	fmt.Fprintf(conn, "a2 DELETE {5}\r\n")
+	_, _ = fmt.Fprintf(conn, "a2 DELETE {5}\r\n")
 	contLine, err := reader.ReadString('\n')
 	if err != nil {
 		t.Fatalf("read continuation: %v", err)
@@ -1200,7 +1200,7 @@ func TestDeleteLiteralBlocked(t *testing.T) {
 		t.Fatalf("expected continuation, got: %s", contLine)
 	}
 	// Send literal data
-	fmt.Fprintf(conn, "Trash\r\n")
+	_, _ = fmt.Fprintf(conn, "Trash\r\n")
 	resp := readTagged(t, reader, "a2")
 	if !strings.Contains(resp, "a2 NO") {
 		t.Errorf("DELETE with literal Trash should be blocked, got: %s", resp)
@@ -1218,12 +1218,12 @@ func TestDeleteLiteralBlocked(t *testing.T) {
 func TestDeleteLiteralPlusBlocked(t *testing.T) {
 	_, connect, sendAndRead := startProxy(t, testRules())
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
 	// DELETE Trash using LITERAL+ — proxy must NOT send a continuation response
-	fmt.Fprintf(conn, "a2 DELETE {5+}\r\nTrash\r\n")
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _ = fmt.Fprintf(conn, "a2 DELETE {5+}\r\nTrash\r\n")
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -1244,11 +1244,11 @@ func TestDeleteLiteralPlusBlocked(t *testing.T) {
 func TestRenameLiteralBlocked(t *testing.T) {
 	_, connect, sendAndRead := startProxy(t, testRules())
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
 	// RENAME Trash using IMAP synchronizing literal
-	fmt.Fprintf(conn, "a2 RENAME {5}\r\n")
+	_, _ = fmt.Fprintf(conn, "a2 RENAME {5}\r\n")
 	contLine, err := reader.ReadString('\n')
 	if err != nil {
 		t.Fatalf("read continuation: %v", err)
@@ -1256,7 +1256,7 @@ func TestRenameLiteralBlocked(t *testing.T) {
 	if !strings.HasPrefix(contLine, "+ ") {
 		t.Fatalf("expected continuation, got: %s", contLine)
 	}
-	fmt.Fprintf(conn, "Trash NewName\r\n")
+	_, _ = fmt.Fprintf(conn, "Trash NewName\r\n")
 	resp := readTagged(t, reader, "a2")
 	if !strings.Contains(resp, "a2 NO") {
 		t.Errorf("RENAME with literal Trash should be blocked, got: %s", resp)
@@ -1266,11 +1266,11 @@ func TestRenameLiteralBlocked(t *testing.T) {
 func TestDeleteLiteralAllowed(t *testing.T) {
 	upstream, connect, sendAndRead := startProxy(t, testRules())
 	reader, conn := connect(t)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	sendAndRead(t, reader, conn, "a1 LOGIN user pass")
 
 	// DELETE "OldFolder" via literal — should be allowed (not protected)
-	fmt.Fprintf(conn, "a2 DELETE {9}\r\n")
+	_, _ = fmt.Fprintf(conn, "a2 DELETE {9}\r\n")
 	contLine, err := reader.ReadString('\n')
 	if err != nil {
 		t.Fatalf("read continuation: %v", err)
@@ -1278,7 +1278,7 @@ func TestDeleteLiteralAllowed(t *testing.T) {
 	if !strings.HasPrefix(contLine, "+ ") {
 		t.Fatalf("expected continuation, got: %s", contLine)
 	}
-	fmt.Fprintf(conn, "OldFolder\r\n")
+	_, _ = fmt.Fprintf(conn, "OldFolder\r\n")
 	resp := readTagged(t, reader, "a2")
 	if !strings.Contains(resp, "a2 OK") {
 		t.Errorf("DELETE of OldFolder should be allowed, got: %s", resp)
@@ -1307,7 +1307,7 @@ func TestDeleteLiteralAllowed(t *testing.T) {
 
 func TestConnectionLimit(t *testing.T) {
 	upstream := newMockUpstream(t, mockSTARTTLS)
-	defer upstream.listener.Close()
+	defer func() { _ = upstream.listener.Close() }()
 	go upstream.serve()
 
 	cfg := testConfig(upstream.addr())
@@ -1318,7 +1318,7 @@ func TestConnectionLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	defer proxyLn.Close()
+	defer func() { _ = proxyLn.Close() }()
 
 	// Mirror the production accept loop: pre-increment activeConns before spawning goroutine
 	go func() {
@@ -1328,7 +1328,7 @@ func TestConnectionLimit(t *testing.T) {
 				return
 			}
 			if cfg.maxConnections > 0 && m.activeConns.Load() >= cfg.maxConnections {
-				conn.Close()
+				_ = conn.Close()
 				continue
 			}
 			m.activeConns.Add(1)
@@ -1341,7 +1341,7 @@ func TestConnectionLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first connect: %v", err)
 	}
-	defer conn1.Close()
+	defer func() { _ = conn1.Close() }()
 
 	reader1 := bufio.NewReader(conn1)
 	greeting, err := reader1.ReadString('\n')
@@ -1366,10 +1366,10 @@ func TestConnectionLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second connect: %v", err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	// The rejected connection should be closed by the server
-	conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1)
 	_, err = conn2.Read(buf)
 	if err == nil {
@@ -1401,7 +1401,7 @@ func TestFlushWriter(t *testing.T) {
 	}
 
 	// Close the underlying flate writer to finalize the stream
-	fw.Close()
+	_ = fw.Close()
 
 	// Verify we can decompress it
 	reader := flate.NewReader(bytes.NewReader(buf.Bytes()))

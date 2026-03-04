@@ -28,19 +28,19 @@ import (
 type mockUpstreamMode int
 
 const (
-	mockSTARTTLS  mockUpstreamMode = iota
+	mockSTARTTLS mockUpstreamMode = iota
 	mockPlaintext
 	mockImplicitTLS
 )
 
 // mockUpstream simulates an upstream IMAP server supporting different connection modes.
 type mockUpstream struct {
-	listener       net.Listener
-	received       []string
-	errors         []string
-	mu             sync.Mutex
-	cert           tls.Certificate
-	mode           mockUpstreamMode
+	listener        net.Listener
+	received        []string
+	errors          []string
+	mu              sync.Mutex
+	cert            tls.Certificate
+	mode            mockUpstreamMode
 	supportCOPYUID  bool // when true, COPY/UID COPY/UID MOVE responses include COPYUID
 	supportCompress bool // when true, COMPRESS DEFLATE is accepted
 	done            chan struct{}
@@ -314,7 +314,7 @@ func (m *mockUpstream) serve() {
 }
 
 func (m *mockUpstream) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	switch m.mode {
 	case mockPlaintext:
@@ -328,12 +328,12 @@ func (m *mockUpstream) handleConn(conn net.Conn) {
 }
 
 func (m *mockUpstream) handlePlaintextConn(conn net.Conn) {
-	fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN] Mock server ready\r\n")
+	_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN] Mock server ready\r\n")
 	m.handleIMAPCommands(conn)
 }
 
 func (m *mockUpstream) handleSTARTTLSConn(conn net.Conn) {
-	fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED IDLE AUTH=PLAIN] Mock server ready\r\n")
+	_, _ = fmt.Fprintf(conn, "* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED IDLE AUTH=PLAIN] Mock server ready\r\n")
 
 	reader := bufio.NewReader(conn)
 
@@ -347,7 +347,7 @@ func (m *mockUpstream) handleSTARTTLSConn(conn net.Conn) {
 		m.recordError(fmt.Sprintf("expected STARTTLS, got: %s", line))
 		return
 	}
-	fmt.Fprintf(conn, "%s OK Begin TLS\r\n", parts[0])
+	_, _ = fmt.Fprintf(conn, "%s OK Begin TLS\r\n", parts[0])
 
 	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{m.cert},
@@ -357,7 +357,7 @@ func (m *mockUpstream) handleSTARTTLSConn(conn net.Conn) {
 		m.recordError(fmt.Sprintf("TLS handshake failed: %v", err))
 		return
 	}
-	defer tlsConn.Close()
+	defer func() { _ = tlsConn.Close() }()
 
 	m.handleIMAPCommands(tlsConn)
 }
@@ -375,7 +375,7 @@ func (m *mockUpstream) handleIMAPCommands(conn net.Conn) {
 		// Handle literal continuation: if line ends with {N} or {N+}, send continuation
 		// and read the literal data
 		if n, ok := parseLiteral(line + "\r\n"); ok && n > 0 {
-			fmt.Fprintf(conn, "+ Ready\r\n")
+			_, _ = fmt.Fprintf(conn, "+ Ready\r\n")
 			litBuf := make([]byte, n)
 			if _, err := io.ReadFull(reader, litBuf); err != nil {
 				return
@@ -392,31 +392,31 @@ func (m *mockUpstream) handleIMAPCommands(conn net.Conn) {
 
 		switch cmd {
 		case "LOGIN":
-			fmt.Fprintf(conn, "%s OK [CAPABILITY IMAP4rev1 IDLE MOVE AUTH=PLAIN] LOGIN completed\r\n", tag)
+			_, _ = fmt.Fprintf(conn, "%s OK [CAPABILITY IMAP4rev1 IDLE MOVE AUTH=PLAIN] LOGIN completed\r\n", tag)
 		case "SELECT", "EXAMINE":
 			mailbox := ""
 			if len(parts) > 2 {
 				mailbox = strings.Trim(parts[2], "\"")
 			}
-			fmt.Fprintf(conn, "* 10 EXISTS\r\n")
-			fmt.Fprintf(conn, "* 0 RECENT\r\n")
-			fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
-			fmt.Fprintf(conn, "%s OK [READ-WRITE] %s selected\r\n", tag, mailbox)
+			_, _ = fmt.Fprintf(conn, "* 10 EXISTS\r\n")
+			_, _ = fmt.Fprintf(conn, "* 0 RECENT\r\n")
+			_, _ = fmt.Fprintf(conn, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+			_, _ = fmt.Fprintf(conn, "%s OK [READ-WRITE] %s selected\r\n", tag, mailbox)
 		case "COPY":
 			if m.supportCOPYUID && len(parts) > 2 {
 				// Extract sequence set from "seqset mailbox" args
 				copyArgs := strings.SplitN(parts[2], " ", 2)
 				seqSet := copyArgs[0]
-				fmt.Fprintf(conn, "%s OK [COPYUID 12345 %s %s] COPY completed\r\n", tag, seqSet, seqSet)
+				_, _ = fmt.Fprintf(conn, "%s OK [COPYUID 12345 %s %s] COPY completed\r\n", tag, seqSet, seqSet)
 			} else {
-				fmt.Fprintf(conn, "%s OK COPY completed\r\n", tag)
+				_, _ = fmt.Fprintf(conn, "%s OK COPY completed\r\n", tag)
 			}
 		case "STORE":
-			fmt.Fprintf(conn, "%s OK STORE completed\r\n", tag)
+			_, _ = fmt.Fprintf(conn, "%s OK STORE completed\r\n", tag)
 		case "EXPUNGE":
-			fmt.Fprintf(conn, "%s OK EXPUNGE completed\r\n", tag)
+			_, _ = fmt.Fprintf(conn, "%s OK EXPUNGE completed\r\n", tag)
 		case "MOVE":
-			fmt.Fprintf(conn, "%s OK MOVE completed\r\n", tag)
+			_, _ = fmt.Fprintf(conn, "%s OK MOVE completed\r\n", tag)
 		case "UID":
 			if len(parts) > 2 {
 				subParts := strings.SplitN(parts[2], " ", 2)
@@ -425,16 +425,16 @@ func (m *mockUpstream) handleIMAPCommands(conn net.Conn) {
 					// Extract UID set from "uidset mailbox" args
 					uidArgs := strings.SplitN(subParts[1], " ", 2)
 					uidSet := uidArgs[0]
-					fmt.Fprintf(conn, "%s OK [COPYUID 12345 %s %s] UID %s completed\r\n", tag, uidSet, uidSet, subCmd)
+					_, _ = fmt.Fprintf(conn, "%s OK [COPYUID 12345 %s %s] UID %s completed\r\n", tag, uidSet, uidSet, subCmd)
 				} else {
-					fmt.Fprintf(conn, "%s OK UID %s completed\r\n", tag, subCmd)
+					_, _ = fmt.Fprintf(conn, "%s OK UID %s completed\r\n", tag, subCmd)
 				}
 			} else {
-				fmt.Fprintf(conn, "%s OK UID completed\r\n", tag)
+				_, _ = fmt.Fprintf(conn, "%s OK UID completed\r\n", tag)
 			}
 		case "COMPRESS":
 			if m.supportCompress && len(parts) > 2 && strings.ToUpper(parts[2]) == "DEFLATE" {
-				fmt.Fprintf(conn, "%s OK COMPRESS DEFLATE active\r\n", tag)
+				_, _ = fmt.Fprintf(conn, "%s OK COMPRESS DEFLATE active\r\n", tag)
 				// Drain any buffered data from the bufio.Reader
 				var compInput io.Reader
 				if reader.Buffered() > 0 {
@@ -453,15 +453,15 @@ func (m *mockUpstream) handleIMAPCommands(conn net.Conn) {
 				m.handleCompressedCommands(conn, compReader, fw)
 				return
 			}
-			fmt.Fprintf(conn, "%s NO COMPRESS not supported\r\n", tag)
+			_, _ = fmt.Fprintf(conn, "%s NO COMPRESS not supported\r\n", tag)
 		case "LOGOUT":
-			fmt.Fprintf(conn, "* BYE logging out\r\n")
-			fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
+			_, _ = fmt.Fprintf(conn, "* BYE logging out\r\n")
+			_, _ = fmt.Fprintf(conn, "%s OK LOGOUT completed\r\n", tag)
 			return
 		case "NOOP":
-			fmt.Fprintf(conn, "%s OK NOOP completed\r\n", tag)
+			_, _ = fmt.Fprintf(conn, "%s OK NOOP completed\r\n", tag)
 		default:
-			fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, cmd)
+			_, _ = fmt.Fprintf(conn, "%s OK %s completed\r\n", tag, cmd)
 		}
 	}
 }
@@ -488,20 +488,20 @@ func (m *mockUpstream) handleCompressedCommands(conn net.Conn, reader *bufio.Rea
 			if len(parts) > 2 {
 				mailbox = strings.Trim(parts[2], "\"")
 			}
-			fmt.Fprintf(writer, "* 10 EXISTS\r\n")
-			fmt.Fprintf(writer, "* 0 RECENT\r\n")
-			fmt.Fprintf(writer, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
-			fmt.Fprintf(writer, "%s OK [READ-WRITE] %s selected\r\n", tag, mailbox)
+			_, _ = fmt.Fprintf(writer, "* 10 EXISTS\r\n")
+			_, _ = fmt.Fprintf(writer, "* 0 RECENT\r\n")
+			_, _ = fmt.Fprintf(writer, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+			_, _ = fmt.Fprintf(writer, "%s OK [READ-WRITE] %s selected\r\n", tag, mailbox)
 		case "LOGOUT":
-			fmt.Fprintf(writer, "* BYE logging out\r\n")
-			fmt.Fprintf(writer, "%s OK LOGOUT completed\r\n", tag)
+			_, _ = fmt.Fprintf(writer, "* BYE logging out\r\n")
+			_, _ = fmt.Fprintf(writer, "%s OK LOGOUT completed\r\n", tag)
 			return
 		case "NOOP":
-			fmt.Fprintf(writer, "%s OK NOOP completed\r\n", tag)
+			_, _ = fmt.Fprintf(writer, "%s OK NOOP completed\r\n", tag)
 		case "EXPUNGE":
-			fmt.Fprintf(writer, "%s OK EXPUNGE completed\r\n", tag)
+			_, _ = fmt.Fprintf(writer, "%s OK EXPUNGE completed\r\n", tag)
 		default:
-			fmt.Fprintf(writer, "%s OK %s completed\r\n", tag, cmd)
+			_, _ = fmt.Fprintf(writer, "%s OK %s completed\r\n", tag, cmd)
 		}
 	}
 }
@@ -543,10 +543,10 @@ func startProxy(t *testing.T, rules []rule) (upstream *mockUpstream,
 	}()
 
 	t.Cleanup(func() {
-		proxyLn.Close()
+		_ = proxyLn.Close()
 		<-proxyDone
 		proxyWg.Wait()
-		upstream.listener.Close()
+		_ = upstream.listener.Close()
 		<-upstream.done
 		errs := upstream.getErrors()
 		for _, e := range errs {
@@ -569,7 +569,7 @@ func startProxy(t *testing.T, rules []rule) (upstream *mockUpstream,
 
 	sendAndRead = func(t *testing.T, reader *bufio.Reader, conn net.Conn, cmd string) string {
 		t.Helper()
-		fmt.Fprintf(conn, "%s\r\n", cmd)
+		_, _ = fmt.Fprintf(conn, "%s\r\n", cmd)
 		tag := strings.SplitN(cmd, " ", 2)[0]
 		var resp strings.Builder
 		for {

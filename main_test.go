@@ -284,10 +284,10 @@ func TestHealthEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	ln.Close() // free the port
+	_ = ln.Close() // free the port
 
 	srv := startHealthServer(ln.Addr().String(), m)
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	// Poll until the health server is ready instead of a fixed sleep
 	addr := "http://" + ln.Addr().String()
@@ -295,7 +295,7 @@ func TestHealthEndpoint(t *testing.T) {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(addr + "/healthz")
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -306,7 +306,7 @@ func TestHealthEndpoint(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /healthz: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 200 {
 			t.Errorf("status = %d, want 200", resp.StatusCode)
 		}
@@ -321,7 +321,7 @@ func TestHealthEndpoint(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /metrics: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 200 {
 			t.Errorf("status = %d, want 200", resp.StatusCode)
 		}
