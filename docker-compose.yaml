@@ -2,28 +2,18 @@ services:
   imap-guard:
     build: .
     ports:
-      - "1144:1144"
-      - "8080:8080"
+      # IMAP port — exposed on all interfaces; restrict via firewall if needed
+      - "1143:1143"
+      # Bind health endpoint to localhost — not exposed externally
+      - "127.0.0.1:8080:8080"
     environment:
-      IMAP_GUARD_LISTEN: ":1144"
-      IMAP_GUARD_UPSTREAM: "proton-bridge:1143"
-      IMAP_GUARD_UPSTREAM_TLS: "starttls"
-      IMAP_GUARD_UPSTREAM_VERIFY: "skip"
+      IMAP_GUARD_LISTEN: ":1143"
+      IMAP_GUARD_UPSTREAM: "imap.gmail.com:993"
+      IMAP_GUARD_UPSTREAM_TLS: "tls"
       IMAP_GUARD_CONFIG: "/etc/imap-guard/rules.yaml"
       IMAP_GUARD_HEALTH_LISTEN: ":8080"
       IMAP_GUARD_LOG_FORMAT: "json"
     volumes:
+      # Mount rules config read-only; see imap-guard.yaml for example ACL rules
       - ./imap-guard.yaml:/etc/imap-guard/rules.yaml:ro
-    depends_on:
-      - proton-bridge
     restart: unless-stopped
-
-  proton-bridge:
-    image: shenxn/protonmail-bridge
-    volumes:
-      - proton-bridge-data:/root
-    ports:
-      - "1143:1143"
-
-volumes:
-  proton-bridge-data:

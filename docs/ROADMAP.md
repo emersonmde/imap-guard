@@ -16,7 +16,7 @@ Current version: **v1.0**
 Single-file IMAP proxy with hardcoded protections.
 
 - Listens for plaintext IMAP connections
-- Connects to upstream via STARTTLS (assumes Proton Bridge-style setup)
+- Connects to upstream via STARTTLS
 - Strips STARTTLS and LOGINDISABLED capabilities
 - Blocks EXPUNGE and STORE +\Deleted on hardcoded Trash/Drafts mailboxes
 - Full test suite with mock upstream server
@@ -35,7 +35,7 @@ Single-file IMAP proxy with hardcoded protections.
 - Protected mailbox list is hardcoded, not configurable → *fixed in v0.4 ACL system*
 - Default listen port is `:144` (not standard IMAP port 143, requires root) → *fixed in v0.3*
 - Blocked response write errors are silently ignored → *fixed in v0.2*
-- Test goroutines call `t.Errorf` from background goroutines (panics on Go 1.24+)
+- Test goroutines call `t.Errorf` from background goroutines (panics on Go 1.24+) → *fixed in v0.2*
 
 ---
 
@@ -60,7 +60,7 @@ Fix correctness issues found in code review.
 
 ## v0.3 — Upstream Connection Modes
 
-Remove Proton Bridge assumptions. Support any IMAP server.
+Support any IMAP server (not just STARTTLS).
 
 - [x] Configurable upstream connection mode:
   - `plaintext` — connect without TLS (local/trusted network)

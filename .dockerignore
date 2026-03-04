@@ -1,0 +1,6 @@
+.git
+*.test
+imap-guard
+.claude/
+docs/
+.github/

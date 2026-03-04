@@ -184,9 +184,9 @@ IMAP_GUARD_UPSTREAM=mail.example.com:143 imap-guard
 
 Connects plaintext, upgrades to TLS via STARTTLS, and verifies the server certificate.
 
-### Proton Bridge
+### Self-signed certificate upstream
 
-Proton Bridge uses STARTTLS with a self-signed certificate. Run imap-guard on a different port and skip certificate verification:
+If your upstream uses a self-signed certificate (common with local IMAP bridges), skip certificate verification:
 
 ```sh
 IMAP_GUARD_LISTEN=:1144 IMAP_GUARD_UPSTREAM=127.0.0.1:1143 IMAP_GUARD_UPSTREAM_VERIFY=skip imap-guard
@@ -247,7 +247,16 @@ docker build -t imap-guard .
 docker run -e IMAP_GUARD_UPSTREAM=imap.gmail.com:993 -e IMAP_GUARD_UPSTREAM_TLS=tls -p 1143:1143 imap-guard
 ```
 
-A `docker-compose.yaml` is included with an example Proton Bridge setup.
+Without `IMAP_GUARD_CONFIG`, the container runs as a pure pass-through proxy (no commands blocked). Mount a config file to enable ACL rules:
+
+```sh
+docker run -e IMAP_GUARD_UPSTREAM=imap.gmail.com:993 -e IMAP_GUARD_UPSTREAM_TLS=tls \
+  -e IMAP_GUARD_CONFIG=/etc/imap-guard/rules.yaml \
+  -v ./imap-guard.yaml:/etc/imap-guard/rules.yaml:ro \
+  -p 1143:1143 imap-guard
+```
+
+A `docker-compose.yaml` is included with an example setup.
 
 ## Testing
 

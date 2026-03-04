@@ -1,0 +1,13 @@
+# imap-guard ACL rules
+# See README.md for full documentation on deny entries and glob patterns.
+
+rules:
+  - mailbox: "*trash*"
+    deny: [CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+    deny-unless-copied: [EXPUNGE]
+
+  - mailbox: "*drafts*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+
+  - mailbox: "*junk*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
