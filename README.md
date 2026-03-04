@@ -1,6 +1,6 @@
 # imap-guard
 
-An IMAP proxy that prevents permanent deletion of messages in protected mailboxes. Sits between an IMAP client and an upstream IMAP server, intercepting and blocking destructive operations while passing everything else through.
+An IMAP proxy that blocks destructive operations on configurable mailboxes. Sits between an IMAP client and an upstream IMAP server, evaluating commands against YAML-based ACL rules. Without a config file, it operates as a pure pass-through proxy.
 
 ## Install
 
@@ -28,30 +28,63 @@ All configuration is via environment variables.
 | `IMAP_GUARD_UPSTREAM_VERIFY` | `verify` | TLS verification: `verify` (system CAs), `skip` (insecure), or path to CA PEM file |
 | `IMAP_GUARD_CLIENT_TLS_CERT` | (empty) | Path to PEM certificate for client-facing TLS |
 | `IMAP_GUARD_CLIENT_TLS_KEY` | (empty) | Path to PEM private key for client-facing TLS |
+| `IMAP_GUARD_CONFIG` | (empty) | Path to YAML ACL config file |
 
-### Protected mailboxes
+### ACL configuration
 
-Any mailbox whose name contains one of these keywords (case-insensitive) is protected:
+Without a config file (`IMAP_GUARD_CONFIG` unset), imap-guard is a pure pass-through proxy — no commands are blocked. To enforce rules, create a YAML config file:
 
-- `trash`
-- `drafts`
-- `junk`
+```yaml
+# imap-guard.yaml
+rules:
+  - mailbox: "*trash*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+  - mailbox: "*drafts*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+  - mailbox: "*junk*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+```
 
-This matches standard names (`Trash`) and path-prefixed names (`Folders/Trash`, `INBOX.Trash`).
+```sh
+IMAP_GUARD_CONFIG=imap-guard.yaml imap-guard
+```
 
-### Blocked operations on protected mailboxes
+Rules are evaluated in order — first match wins. If no rule matches a command, it passes through.
 
-| Command | Reason |
+#### Deny entry syntax
+
+| Deny entry | Effect |
 |---|---|
-| `EXPUNGE` / `UID EXPUNGE` | Permanently removes messages |
-| `CLOSE` | Implicitly expunges all \Deleted messages |
-| `DELETE` | Destroys the entire mailbox |
-| `RENAME` | Moves mailbox out of protection scope |
-| `MOVE` / `UID MOVE` | Relocates messages to an unprotected mailbox |
-| `STORE +FLAGS (\Deleted)` | Marks messages for deletion |
-| `COMPRESS` | Would make traffic opaque, bypassing enforcement |
+| `EXPUNGE` | Block EXPUNGE and UID EXPUNGE |
+| `CLOSE` | Block CLOSE (implicitly expunges) |
+| `DELETE` | Block DELETE (destroys mailbox) |
+| `RENAME` | Block RENAME (moves mailbox out of scope) |
+| `MOVE` | Block MOVE and UID MOVE |
+| `COMPRESS` | Block COMPRESS DEFLATE |
+| `STORE` | Block all STORE commands |
+| `"STORE +\Deleted"` | Block STORE when adding `\Deleted` flag (+FLAGS or FLAGS) |
+| `"STORE -\Seen"` | Block STORE when removing `\Seen` flag (-FLAGS) |
 
-All other IMAP commands pass through unmodified, including `COPY`, `FETCH`, `SEARCH`, `STORE +FLAGS (\Seen)`, `STORE -FLAGS (\Deleted)`, etc.
+Commands not in the deny list pass through. All other IMAP commands (COPY, FETCH, SEARCH, NOOP, etc.) are never blocked.
+
+DELETE and RENAME are evaluated against the target mailbox name from the command arguments (not the currently selected mailbox). All other commands are evaluated against the currently selected mailbox.
+
+#### Glob patterns
+
+Mailbox patterns support `*` (matches any characters, including hierarchy separators `/` and `.`) and `?` (matches exactly one character). Matching is case-insensitive.
+
+| Pattern | Matches |
+|---|---|
+| `Trash` | `Trash`, `trash`, `TRASH` |
+| `*trash*` | `Trash`, `Folders/Trash`, `INBOX.Trash` |
+| `INBOX.*` | `INBOX.Sent`, `INBOX.Drafts` |
+| `*` | All mailboxes |
+
+### Migrating from v0.3
+
+v0.3 had hardcoded protection for mailboxes containing "trash", "drafts", or "junk". v0.4 replaces this with configurable ACL rules. **This is a breaking change** — without a config file, no commands are blocked.
+
+To restore v0.3 behavior, create a config file with the example YAML above and set `IMAP_GUARD_CONFIG` to its path.
 
 ## Usage
 
@@ -119,6 +152,7 @@ ExecStart=/path/to/imap-guard
 Environment=IMAP_GUARD_LISTEN=:1143
 Environment=IMAP_GUARD_UPSTREAM=imap.gmail.com:993
 Environment=IMAP_GUARD_UPSTREAM_TLS=tls
+Environment=IMAP_GUARD_CONFIG=/etc/imap-guard/rules.yaml
 Restart=always
 
 [Install]

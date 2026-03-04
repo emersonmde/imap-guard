@@ -71,134 +71,417 @@ func TestExtractMailbox(t *testing.T) {
 	}
 }
 
-func TestIsProtected(t *testing.T) {
+func TestGlobMatch(t *testing.T) {
 	tests := []struct {
-		mailbox string
+		pattern string
+		name    string
 		want    bool
 	}{
-		{"Trash", true},
-		{"trash", true},
-		{"TRASH", true},
-		{"Drafts", true},
-		{"drafts", true},
-		{"DRAFTS", true},
-		{"Junk", true},
-		{"junk", true},
-		{"JUNK", true},
-		{"Folders/Trash", true},
-		{"Folders/Drafts", true},
-		{"Folders/Junk", true},
-		{"INBOX.Trash", true},
-		{"INBOX", false},
-		{"Sent", false},
-		{"Folders/Marketing", false},
-		{"Archive", false},
-		{"", false},
+		// Exact match (case-insensitive)
+		{"Trash", "Trash", true},
+		{"Trash", "trash", true},
+		{"Trash", "TRASH", true},
+		{"Trash", "INBOX", false},
+
+		// Wildcard *
+		{"*trash*", "Trash", true},
+		{"*trash*", "Folders/Trash", true},
+		{"*trash*", "INBOX.Trash", true},
+		{"*trash*", "INBOX.Trash.Old", true},
+		{"*trash*", "INBOX", false},
+		{"*", "anything", true},
+		{"*", "", true},
+
+		// Wildcard ?
+		{"Tras?", "Trash", true},
+		{"Tras?", "Tras", false},
+		{"Tras?", "Trashy", false},
+		{"?rash", "Trash", true},
+
+		// Hierarchy separators (/ and .)
+		{"Folders/*", "Folders/Trash", true},
+		{"Folders/*", "Folders/Drafts", true},
+		{"INBOX.*", "INBOX.Trash", true},
+		{"*.*", "INBOX.Trash", true},
+		{"*/*", "Folders/Trash", true},
+
+		// Edge cases
+		{"", "", true},
+		{"", "x", false},
+		{"x", "", false},
+		{"**", "anything", true},
+		{"*?*", "x", true},
+		{"*?*", "", false},
 	}
 	for _, tt := range tests {
-		got := isProtected(tt.mailbox)
+		got := globMatch(tt.pattern, tt.name)
 		if got != tt.want {
-			t.Errorf("isProtected(%q) = %v, want %v", tt.mailbox, got, tt.want)
+			t.Errorf("globMatch(%q, %q) = %v, want %v", tt.pattern, tt.name, got, tt.want)
 		}
 	}
 }
 
-func TestStoreAddsDeleted(t *testing.T) {
+func TestParseDenyEntry(t *testing.T) {
 	tests := []struct {
-		args string
-		want bool
+		input   string
+		want    denyEntry
+		wantErr bool
 	}{
-		// Should block
-		{"1:* +FLAGS (\\Deleted)", true},
-		{"1 +FLAGS (\\Deleted)", true},
-		{"1:* +FLAGS.SILENT (\\Deleted)", true},
-		{"1:* FLAGS (\\Deleted)", true},
-		{"1:* FLAGS.SILENT (\\Deleted)", true},
-		{"1:* +FLAGS (\\Seen \\Deleted)", true},
-		{"1:* FLAGS (\\Deleted \\Seen)", true},
+		// Simple commands
+		{"EXPUNGE", denyEntry{command: "EXPUNGE"}, false},
+		{"CLOSE", denyEntry{command: "CLOSE"}, false},
+		{"DELETE", denyEntry{command: "DELETE"}, false},
+		{"RENAME", denyEntry{command: "RENAME"}, false},
+		{"MOVE", denyEntry{command: "MOVE"}, false},
+		{"COMPRESS", denyEntry{command: "COMPRESS"}, false},
 
-		// Should NOT block
-		{"1:* -FLAGS (\\Deleted)", false},
-		{"1:* -FLAGS.SILENT (\\Deleted)", false},
-		{"1:* +FLAGS (\\Seen)", false},
-		{"1:* +FLAGS (\\Flagged)", false},
-		{"1:* FLAGS (\\Seen \\Flagged)", false},
-		{"1:* +FLAGS.SILENT (\\Seen)", false},
+		// Case insensitive
+		{"expunge", denyEntry{command: "EXPUNGE"}, false},
 
-		// Edge cases
-		{"", false},
-		{"1:*", false},
-		{"1:* +FLAGS", false},
+		// STORE without qualifier (blocks all STORE)
+		{"STORE", denyEntry{command: "STORE"}, false},
+
+		// STORE with qualifiers
+		{`STORE +\Deleted`, denyEntry{command: "STORE", storeOp: "+", storeFlag: `\DELETED`}, false},
+		{`STORE -\Seen`, denyEntry{command: "STORE", storeOp: "-", storeFlag: `\SEEN`}, false},
+		{`STORE +\Flagged`, denyEntry{command: "STORE", storeOp: "+", storeFlag: `\FLAGGED`}, false},
+
+		// Invalid
+		{"", denyEntry{}, true},
+		{"BADCMD", denyEntry{}, true},
+		{"EXPUNGE extra", denyEntry{}, true},     // non-STORE with args
+		{"STORE +", denyEntry{}, true},            // missing flag
+		{"STORE noop", denyEntry{}, true},         // no + or - prefix
 	}
 	for _, tt := range tests {
-		got := storeAddsDeleted(tt.args)
-		if got != tt.want {
-			t.Errorf("storeAddsDeleted(%q) = %v, want %v", tt.args, got, tt.want)
+		got, err := parseDenyEntry(tt.input)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("parseDenyEntry(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			continue
+		}
+		if err == nil && got != tt.want {
+			t.Errorf("parseDenyEntry(%q) = %+v, want %+v", tt.input, got, tt.want)
 		}
 	}
+}
+
+func TestLoadACLConfig(t *testing.T) {
+	t.Run("empty path returns nil", func(t *testing.T) {
+		rules, err := loadACLConfig("")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rules != nil {
+			t.Errorf("expected nil rules, got %v", rules)
+		}
+	})
+
+	t.Run("valid config", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		os.WriteFile(path, []byte(`
+rules:
+  - mailbox: "*trash*"
+    deny: [EXPUNGE, CLOSE, "STORE +\\Deleted"]
+  - mailbox: "*drafts*"
+    deny: [DELETE, RENAME]
+`), 0o600)
+
+		rules, err := loadACLConfig(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 2 {
+			t.Fatalf("expected 2 rules, got %d", len(rules))
+		}
+		if rules[0].mailbox != "*trash*" {
+			t.Errorf("rule 0 mailbox = %q, want *trash*", rules[0].mailbox)
+		}
+		if len(rules[0].deny) != 3 {
+			t.Errorf("rule 0 deny count = %d, want 3", len(rules[0].deny))
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		_, err := loadACLConfig("/nonexistent/config.yaml")
+		if err == nil {
+			t.Fatal("expected error for missing file")
+		}
+	})
+
+	t.Run("invalid YAML", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "bad.yaml")
+		os.WriteFile(path, []byte("not: [valid: yaml"), 0o600)
+
+		_, err := loadACLConfig(path)
+		if err == nil {
+			t.Fatal("expected error for invalid YAML")
+		}
+	})
+
+	t.Run("invalid deny entry", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "bad-deny.yaml")
+		os.WriteFile(path, []byte(`
+rules:
+  - mailbox: "*trash*"
+    deny: [BADCOMMAND]
+`), 0o600)
+
+		_, err := loadACLConfig(path)
+		if err == nil {
+			t.Fatal("expected error for invalid deny entry")
+		}
+	})
+
+	t.Run("missing mailbox", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "no-mailbox.yaml")
+		os.WriteFile(path, []byte(`
+rules:
+  - deny: [EXPUNGE]
+`), 0o600)
+
+		_, err := loadACLConfig(path)
+		if err == nil {
+			t.Fatal("expected error for missing mailbox")
+		}
+	})
+
+	t.Run("empty file returns empty rules", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "empty.yaml")
+		os.WriteFile(path, []byte(""), 0o600)
+
+		rules, err := loadACLConfig(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 0 {
+			t.Errorf("expected 0 rules, got %d", len(rules))
+		}
+	})
+}
+
+func TestParseStoreArgs(t *testing.T) {
+	tests := []struct {
+		args     string
+		wantOp   string
+		wantFlags string
+	}{
+		// Add flags
+		{"1:* +FLAGS (\\Deleted)", "+", "(\\DELETED)"},
+		{"1 +FLAGS (\\Deleted)", "+", "(\\DELETED)"},
+		{"1:* +FLAGS.SILENT (\\Deleted)", "+", "(\\DELETED)"},
+		{"1:* +FLAGS (\\Seen \\Deleted)", "+", "(\\SEEN \\DELETED)"},
+
+		// Replace flags (bare FLAGS — treated as +)
+		{"1:* FLAGS (\\Deleted)", "+", "(\\DELETED)"},
+		{"1:* FLAGS.SILENT (\\Deleted)", "+", "(\\DELETED)"},
+
+		// Remove flags
+		{"1:* -FLAGS (\\Deleted)", "-", "(\\DELETED)"},
+		{"1:* -FLAGS.SILENT (\\Deleted)", "-", "(\\DELETED)"},
+		{"1:* -FLAGS (\\Seen)", "-", "(\\SEEN)"},
+
+		// Edge cases
+		{"", "", ""},
+		{"1:*", "", ""},
+		{"1:* +FLAGS", "", ""},
+	}
+	for _, tt := range tests {
+		op, flags := parseStoreArgs(tt.args)
+		if op != tt.wantOp || flags != tt.wantFlags {
+			t.Errorf("parseStoreArgs(%q) = (%q, %q), want (%q, %q)",
+				tt.args, op, flags, tt.wantOp, tt.wantFlags)
+		}
+	}
+}
+
+func TestEvalACL(t *testing.T) {
+	rules := []rule{
+		{
+			mailbox: "*trash*",
+			deny: []denyEntry{
+				{command: "EXPUNGE"},
+				{command: "CLOSE"},
+				{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+			},
+		},
+		{
+			mailbox: "*drafts*",
+			deny: []denyEntry{
+				{command: "DELETE"},
+				{command: "RENAME"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		mailbox   string
+		cmd       string
+		storeOp   string
+		storeFlags string
+		wantBlock bool
+	}{
+		{"expunge in trash", "Trash", "EXPUNGE", "", "", true},
+		{"close in trash", "Trash", "CLOSE", "", "", true},
+		{"store deleted in trash", "Trash", "STORE", "+", `(\DELETED)`, true},
+		{"store seen in trash", "Trash", "STORE", "+", `(\SEEN)`, false},
+		{"remove deleted in trash", "Trash", "STORE", "-", `(\DELETED)`, false},
+		{"delete in drafts", "Drafts", "DELETE", "", "", true},
+		{"rename in drafts", "Drafts", "RENAME", "", "", true},
+		{"expunge in drafts", "Drafts", "EXPUNGE", "", "", false},
+		{"expunge in inbox", "INBOX", "EXPUNGE", "", "", false},
+		{"nil rules never blocks", "Trash", "EXPUNGE", "", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := rules
+			if tt.name == "nil rules never blocks" {
+				r = nil
+			}
+			blocked, _ := evalACL(r, tt.mailbox, tt.cmd, tt.storeOp, tt.storeFlags)
+			if blocked != tt.wantBlock {
+				t.Errorf("evalACL(%q, %q) blocked=%v, want %v",
+					tt.mailbox, tt.cmd, blocked, tt.wantBlock)
+			}
+		})
+	}
+
+	t.Run("first match wins", func(t *testing.T) {
+		overlapping := []rule{
+			{mailbox: "Trash", deny: []denyEntry{{command: "EXPUNGE"}}},
+			{mailbox: "*", deny: nil}, // catch-all with no denies
+		}
+		blocked, desc := evalACL(overlapping, "Trash", "EXPUNGE", "", "")
+		if !blocked {
+			t.Errorf("expected block from first rule, got allow")
+		}
+		if !strings.Contains(desc, "rule[0]") {
+			t.Errorf("expected rule[0] in desc, got %q", desc)
+		}
+	})
+
+	t.Run("wildcard rule", func(t *testing.T) {
+		wildcardRules := []rule{
+			{mailbox: "*", deny: []denyEntry{{command: "EXPUNGE"}}},
+		}
+		blocked, _ := evalACL(wildcardRules, "INBOX", "EXPUNGE", "", "")
+		if !blocked {
+			t.Error("expected wildcard rule to block EXPUNGE on any mailbox")
+		}
+	})
+
+	t.Run("STORE blocks all when no qualifier", func(t *testing.T) {
+		storeAllRules := []rule{
+			{mailbox: "*trash*", deny: []denyEntry{{command: "STORE"}}},
+		}
+		blocked, _ := evalACL(storeAllRules, "Trash", "STORE", "+", `(\SEEN)`)
+		if !blocked {
+			t.Error("expected unqualified STORE deny to block all STORE commands")
+		}
+	})
 }
 
 func TestShouldBlock(t *testing.T) {
-	protected := &connState{selectedMailbox: "Trash", isProtected: true}
-	unprotected := &connState{selectedMailbox: "INBOX", isProtected: false}
+	// Rules equivalent to the old hardcoded protection
+	rules := []rule{
+		{
+			mailbox: "*trash*",
+			deny: []denyEntry{
+				{command: "EXPUNGE"}, {command: "CLOSE"}, {command: "DELETE"},
+				{command: "RENAME"}, {command: "MOVE"}, {command: "COMPRESS"},
+				{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+			},
+		},
+		{
+			mailbox: "*drafts*",
+			deny: []denyEntry{
+				{command: "EXPUNGE"}, {command: "CLOSE"}, {command: "DELETE"},
+				{command: "RENAME"}, {command: "MOVE"}, {command: "COMPRESS"},
+				{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+			},
+		},
+		{
+			mailbox: "*junk*",
+			deny: []denyEntry{
+				{command: "EXPUNGE"}, {command: "CLOSE"}, {command: "DELETE"},
+				{command: "RENAME"}, {command: "MOVE"}, {command: "COMPRESS"},
+				{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+			},
+		},
+	}
+
+	inTrash := &connState{selectedMailbox: "Trash"}
+	inInbox := &connState{selectedMailbox: "INBOX"}
 
 	tests := []struct {
 		name  string
 		cmd   string
 		args  string
 		state *connState
+		rules []rule
 		want  bool
 	}{
 		// Blocked on protected
-		{"expunge in trash", "EXPUNGE", "", protected, true},
-		{"close in trash", "CLOSE", "", protected, true},
-		{"move in trash", "MOVE", "5 INBOX", protected, true},
-		{"store deleted in trash", "STORE", "1:* +FLAGS (\\Deleted)", protected, true},
-		{"store silent deleted in trash", "STORE", "1:* +FLAGS.SILENT (\\Deleted)", protected, true},
-		{"store replace deleted in trash", "STORE", "1:* FLAGS (\\Deleted)", protected, true},
-		{"uid expunge in trash", "UID", "EXPUNGE 100", protected, true},
-		{"uid store deleted in trash", "UID", "STORE 100 +FLAGS (\\Deleted)", protected, true},
-		{"uid move in trash", "UID", "MOVE 100 INBOX", protected, true},
+		{"expunge in trash", "EXPUNGE", "", inTrash, rules, true},
+		{"close in trash", "CLOSE", "", inTrash, rules, true},
+		{"move in trash", "MOVE", "5 INBOX", inTrash, rules, true},
+		{"store deleted in trash", "STORE", "1:* +FLAGS (\\Deleted)", inTrash, rules, true},
+		{"store silent deleted in trash", "STORE", "1:* +FLAGS.SILENT (\\Deleted)", inTrash, rules, true},
+		{"store replace deleted in trash", "STORE", "1:* FLAGS (\\Deleted)", inTrash, rules, true},
+		{"uid expunge in trash", "UID", "EXPUNGE 100", inTrash, rules, true},
+		{"uid store deleted in trash", "UID", "STORE 100 +FLAGS (\\Deleted)", inTrash, rules, true},
+		{"uid move in trash", "UID", "MOVE 100 INBOX", inTrash, rules, true},
 
 		// DELETE/RENAME target a named mailbox, blocked when targeting protected
-		{"delete trash", "DELETE", "Trash", protected, true},
-		{"delete trash case insensitive", "DELETE", "trash", protected, true},
-		{"delete quoted trash", "DELETE", "\"Trash\"", protected, true},
-		{"rename trash", "RENAME", "Trash NewName", protected, true},
-		{"rename trash case insensitive", "RENAME", "TRASH NewName", protected, true},
+		{"delete trash", "DELETE", "Trash", inTrash, rules, true},
+		{"delete trash case insensitive", "DELETE", "trash", inTrash, rules, true},
+		{"delete quoted trash", "DELETE", "\"Trash\"", inTrash, rules, true},
+		{"rename trash", "RENAME", "Trash NewName", inTrash, rules, true},
+		{"rename trash case insensitive", "RENAME", "TRASH NewName", inTrash, rules, true},
 
 		// DELETE/RENAME on unprotected targets — allowed even when selected is protected
-		{"delete inbox while in trash", "DELETE", "SomeFolder", protected, false},
-		{"rename inbox while in trash", "RENAME", "SomeFolder NewName", protected, false},
+		{"delete inbox while in trash", "DELETE", "SomeFolder", inTrash, rules, false},
+		{"rename inbox while in trash", "RENAME", "SomeFolder NewName", inTrash, rules, false},
 
 		// DELETE/RENAME on protected targets — blocked even when selected is unprotected
-		{"delete trash while in inbox", "DELETE", "Trash", unprotected, true},
-		{"rename trash while in inbox", "RENAME", "Trash NewName", unprotected, true},
-		{"rename drafts while in inbox", "RENAME", "Drafts NewName", unprotected, true},
+		{"delete trash while in inbox", "DELETE", "Trash", inInbox, rules, true},
+		{"rename trash while in inbox", "RENAME", "Trash NewName", inInbox, rules, true},
+		{"rename drafts while in inbox", "RENAME", "Drafts NewName", inInbox, rules, true},
 
-		// COMPRESS blocked when in protected mailbox (would bypass ACLs)
-		{"compress in trash", "COMPRESS", "DEFLATE", protected, true},
-		{"compress in inbox", "COMPRESS", "DEFLATE", unprotected, false},
+		// COMPRESS blocked when in protected mailbox
+		{"compress in trash", "COMPRESS", "DEFLATE", inTrash, rules, true},
+		{"compress in inbox", "COMPRESS", "DEFLATE", inInbox, rules, false},
 
 		// Allowed on protected
-		{"copy in trash", "COPY", "5 INBOX", protected, false},
-		{"store seen in trash", "STORE", "1:* +FLAGS (\\Seen)", protected, false},
-		{"remove deleted in trash", "STORE", "1:* -FLAGS (\\Deleted)", protected, false},
-		{"fetch in trash", "FETCH", "1:* (FLAGS)", protected, false},
-		{"search in trash", "SEARCH", "ALL", protected, false},
-		{"noop in trash", "NOOP", "", protected, false},
-		{"uid fetch in trash", "UID", "FETCH 100 (FLAGS)", protected, false},
+		{"copy in trash", "COPY", "5 INBOX", inTrash, rules, false},
+		{"store seen in trash", "STORE", "1:* +FLAGS (\\Seen)", inTrash, rules, false},
+		{"remove deleted in trash", "STORE", "1:* -FLAGS (\\Deleted)", inTrash, rules, false},
+		{"fetch in trash", "FETCH", "1:* (FLAGS)", inTrash, rules, false},
+		{"search in trash", "SEARCH", "ALL", inTrash, rules, false},
+		{"noop in trash", "NOOP", "", inTrash, rules, false},
+		{"uid fetch in trash", "UID", "FETCH 100 (FLAGS)", inTrash, rules, false},
 
 		// Nothing blocked on unprotected (except DELETE/RENAME targeting protected)
-		{"expunge in inbox", "EXPUNGE", "", unprotected, false},
-		{"close in inbox", "CLOSE", "", unprotected, false},
-		{"move in inbox", "MOVE", "5 Trash", unprotected, false},
-		{"store deleted in inbox", "STORE", "1:* +FLAGS (\\Deleted)", unprotected, false},
-		{"uid expunge in inbox", "UID", "EXPUNGE 100", unprotected, false},
+		{"expunge in inbox", "EXPUNGE", "", inInbox, rules, false},
+		{"close in inbox", "CLOSE", "", inInbox, rules, false},
+		{"move in inbox", "MOVE", "5 Trash", inInbox, rules, false},
+		{"store deleted in inbox", "STORE", "1:* +FLAGS (\\Deleted)", inInbox, rules, false},
+		{"uid expunge in inbox", "UID", "EXPUNGE 100", inInbox, rules, false},
+
+		// No rules = pure pass-through
+		{"no rules expunge in trash", "EXPUNGE", "", inTrash, nil, false},
+		{"no rules store deleted in trash", "STORE", "1:* +FLAGS (\\Deleted)", inTrash, nil, false},
+		{"no rules delete trash", "DELETE", "Trash", inInbox, nil, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldBlock(tt.cmd, tt.args, tt.state)
+			got, _ := shouldBlock(tt.cmd, tt.args, tt.state, tt.rules)
 			if got != tt.want {
 				t.Errorf("shouldBlock(%q, %q, mailbox=%s) = %v, want %v",
 					tt.cmd, tt.args, tt.state.selectedMailbox, got, tt.want)
@@ -585,6 +868,39 @@ func testConfig(upstreamAddr string) *config {
 	}
 }
 
+// testRules returns ACL rules equivalent to the old hardcoded protection.
+func testRules() []rule {
+	deny := []denyEntry{
+		{command: "EXPUNGE"}, {command: "CLOSE"}, {command: "DELETE"},
+		{command: "RENAME"}, {command: "MOVE"}, {command: "COMPRESS"},
+		{command: "STORE", storeOp: "+", storeFlag: `\DELETED`},
+	}
+	return []rule{
+		{mailbox: "*trash*", deny: deny},
+		{mailbox: "*drafts*", deny: deny},
+		{mailbox: "*junk*", deny: deny},
+	}
+}
+
+// writeTestACLConfig writes a YAML ACL config file and returns its path.
+func writeTestACLConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "imap-guard.yaml")
+	content := `rules:
+  - mailbox: "*trash*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+  - mailbox: "*drafts*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+  - mailbox: "*junk*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write test ACL config: %v", err)
+	}
+	return path
+}
+
 // mockUpstream simulates an upstream IMAP server supporting different connection modes.
 type mockUpstream struct {
 	listener net.Listener
@@ -800,6 +1116,7 @@ func TestProxyEndToEnd(t *testing.T) {
 	go upstream.serve()
 
 	cfg := testConfig(upstream.addr())
+	rules := testRules()
 
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -813,7 +1130,7 @@ func TestProxyEndToEnd(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleClient(conn, cfg, "test")
+			go handleClient(conn, cfg, rules, "test")
 		}
 	}()
 
@@ -1126,7 +1443,7 @@ func TestProxyPlaintextUpstream(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleClient(conn, cfg, "test")
+			go handleClient(conn, cfg, nil, "test")
 		}
 	}()
 
@@ -1187,7 +1504,7 @@ func TestProxyImplicitTLSUpstream(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleClient(conn, cfg, "test")
+			go handleClient(conn, cfg, nil, "test")
 		}
 	}()
 
@@ -1260,7 +1577,7 @@ func TestProxyClientTLS(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleClient(conn, cfg, "test")
+			go handleClient(conn, cfg, nil, "test")
 		}
 	}()
 
@@ -1321,7 +1638,7 @@ func TestCAFileVerification(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleClient(conn, cfg, "test")
+			go handleClient(conn, cfg, nil, "test")
 		}
 	}()
 
@@ -1356,5 +1673,187 @@ func TestCAFileVerification(t *testing.T) {
 	}
 	if !strings.Contains(resp.String(), "a1 OK") {
 		t.Errorf("LOGIN should succeed with CA verification, got: %s", resp.String())
+	}
+}
+
+func TestNoConfigPassThrough(t *testing.T) {
+	upstream := newMockUpstream(t, mockSTARTTLS)
+	defer upstream.listener.Close()
+	go upstream.serve()
+
+	cfg := testConfig(upstream.addr())
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	defer proxyLn.Close()
+
+	go func() {
+		for {
+			conn, err := proxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleClient(conn, cfg, nil, "test") // nil rules = no blocking
+		}
+	}()
+
+	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	// Read greeting
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
+
+	sendAndRead := func(cmd string) string {
+		fmt.Fprintf(conn, "%s\r\n", cmd)
+		tag := strings.SplitN(cmd, " ", 2)[0]
+		var resp strings.Builder
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("read response for %q: %v", cmd, err)
+			}
+			resp.WriteString(line)
+			if strings.HasPrefix(line, tag+" ") {
+				break
+			}
+		}
+		return resp.String()
+	}
+
+	sendAndRead("a1 LOGIN user pass")
+	sendAndRead("a2 SELECT Trash")
+
+	// All these should pass through without blocking (no rules)
+	commands := []struct {
+		cmd    string
+		wantOK string
+	}{
+		{"a3 EXPUNGE", "a3 OK"},
+		{"a4 STORE 1 +FLAGS (\\Deleted)", "a4 OK"},
+		{"a5 MOVE 5 INBOX", "a5 OK"},
+	}
+
+	for _, tc := range commands {
+		resp := sendAndRead(tc.cmd)
+		if !strings.Contains(resp, tc.wantOK) {
+			t.Errorf("with nil rules, %q should pass through, got: %s", tc.cmd, resp)
+		}
+	}
+}
+
+func TestWildcardRules(t *testing.T) {
+	upstream := newMockUpstream(t, mockSTARTTLS)
+	defer upstream.listener.Close()
+	go upstream.serve()
+
+	cfg := testConfig(upstream.addr())
+
+	// Wildcard rule: block EXPUNGE on all mailboxes
+	wildcardRules := []rule{
+		{mailbox: "*", deny: []denyEntry{{command: "EXPUNGE"}}},
+	}
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	defer proxyLn.Close()
+
+	go func() {
+		for {
+			conn, err := proxyLn.Accept()
+			if err != nil {
+				return
+			}
+			go handleClient(conn, cfg, wildcardRules, "test")
+		}
+	}()
+
+	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read greeting: %v", err)
+	}
+
+	sendAndRead := func(cmd string) string {
+		fmt.Fprintf(conn, "%s\r\n", cmd)
+		tag := strings.SplitN(cmd, " ", 2)[0]
+		var resp strings.Builder
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("read response for %q: %v", cmd, err)
+			}
+			resp.WriteString(line)
+			if strings.HasPrefix(line, tag+" ") {
+				break
+			}
+		}
+		return resp.String()
+	}
+
+	sendAndRead("a1 LOGIN user pass")
+
+	// EXPUNGE should be blocked in any mailbox
+	sendAndRead("a2 SELECT INBOX")
+	resp := sendAndRead("a3 EXPUNGE")
+	if !strings.Contains(resp, "a3 NO") {
+		t.Errorf("wildcard rule should block EXPUNGE in INBOX, got: %s", resp)
+	}
+
+	sendAndRead("a4 SELECT Trash")
+	resp = sendAndRead("a5 EXPUNGE")
+	if !strings.Contains(resp, "a5 NO") {
+		t.Errorf("wildcard rule should block EXPUNGE in Trash, got: %s", resp)
+	}
+
+	// Other commands should still pass through
+	resp = sendAndRead("a6 NOOP")
+	if !strings.Contains(resp, "a6 OK") {
+		t.Errorf("NOOP should pass through with wildcard EXPUNGE rule, got: %s", resp)
+	}
+}
+
+func TestLoadACLConfigFromYAML(t *testing.T) {
+	// Verify that a YAML config file produces working rules
+	path := writeTestACLConfig(t)
+	rules, err := loadACLConfig(path)
+	if err != nil {
+		t.Fatalf("loadACLConfig: %v", err)
+	}
+
+	if len(rules) != 3 {
+		t.Fatalf("expected 3 rules, got %d", len(rules))
+	}
+
+	// Verify rules work: EXPUNGE in Trash should be blocked
+	blocked, _ := evalACL(rules, "Trash", "EXPUNGE", "", "")
+	if !blocked {
+		t.Error("expected EXPUNGE in Trash to be blocked by loaded rules")
+	}
+
+	// STORE +\Deleted in Drafts should be blocked
+	blocked, _ = evalACL(rules, "Drafts", "STORE", "+", `(\DELETED)`)
+	if !blocked {
+		t.Error("expected STORE +\\Deleted in Drafts to be blocked by loaded rules")
+	}
+
+	// EXPUNGE in INBOX should not be blocked
+	blocked, _ = evalACL(rules, "INBOX", "EXPUNGE", "", "")
+	if blocked {
+		t.Error("expected EXPUNGE in INBOX to be allowed by loaded rules")
 	}
 }

@@ -98,46 +98,42 @@ Rules are evaluated in order, first match wins. Default policy is `allow` (the p
 ```yaml
 # imap-guard.yaml
 rules:
-  - mailbox: "Trash"
-    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, "STORE +\\Deleted"]
+  - mailbox: "*trash*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
 
-  - mailbox: "Drafts"
-    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, "STORE +\\Deleted"]
+  - mailbox: "*drafts*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
 
-  # Wildcard: protect all mailboxes from expunge
-  # - mailbox: "*"
-  #   deny: [EXPUNGE]
+  - mailbox: "*junk*"
+    deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
 ```
 
 ### Scope
 
 - Match on mailbox name (exact, case-insensitive) with glob wildcards (`*`, `?`)
-- Match on IMAP command: EXPUNGE, CLOSE, DELETE, RENAME, MOVE, STORE (and their UID variants)
+- Match on IMAP command: EXPUNGE, CLOSE, DELETE, RENAME, MOVE, STORE, COMPRESS (and their UID variants)
 - For STORE commands, match on flag operations (+FLAGS, FLAGS with specific flags like \Deleted)
 - Rules apply to the currently-selected mailbox for most commands
 - DELETE and RENAME match on the mailbox argument (not the selected mailbox), since they target a named mailbox directly
-
-### COMPRESS DEFLATE support (RFC 4978)
-
-When ACL rules are defined and the client negotiates `COMPRESS DEFLATE` with the upstream, the proxy intercepts the successful response and inserts `compress/flate` (Go stdlib) wrappers on both sides of the connection. The proxy continues parsing and evaluating ACLs on the decompressed stream. When no ACL rules are configured, COMPRESS passes through unmodified like everything else — the proxy doesn't need to parse traffic it isn't enforcing rules on.
 
 ### Implementation Notes
 
 Existing Go ACL libraries (casbin, ladon) are designed for web-style RBAC/ABAC and would be heavy dependencies for what is essentially a small lookup table. A custom rule engine is more appropriate here — the domain is narrow (command × mailbox × flags) and the evaluation logic is straightforward.
 
-If the ACL grows to need user-level rules (different restrictions per IMAP user), casbin's model/policy separation could be worth revisiting.
+COMPRESS is handled explicitly — if users want COMPRESS blocked, they add it to the deny list. No implicit blocking.
+
+Config is loaded at startup. Users restart to pick up changes. SIGHUP reload deferred to avoid atomic swap complexity.
 
 ### Tasks
 
-- [ ] Define config file format (YAML)
-- [ ] Implement rule parser and evaluator
-- [ ] Replace `shouldBlock` / `isProtected` / `protectedMailboxes` with rule engine
-- [ ] Handle DELETE and RENAME by matching on command argument (target mailbox), not selected mailbox
-- [ ] Support COMPRESS DEFLATE (RFC 4978): intercept negotiation, wrap both sides with `compress/flate`, continue ACL evaluation on decompressed stream
-- [ ] Support config file path via `IMAP_GUARD_CONFIG` env var
-- [ ] When no config file is present, proxy is fully pass-through (no blocking)
-- [ ] Log which rule matched when blocking a command
-- [ ] Config file reload on SIGHUP (optional, nice to have)
+- [x] Define config file format (YAML)
+- [x] Implement rule parser and evaluator
+- [x] Replace `shouldBlock` / `isProtected` / `protectedMailboxes` with rule engine
+- [x] Handle DELETE and RENAME by matching on command argument (target mailbox), not selected mailbox
+- [x] Support config file path via `IMAP_GUARD_CONFIG` env var
+- [x] When no config file is present, proxy is fully pass-through (no blocking)
+- [x] Log which rule matched when blocking a command
+- [ ] Support COMPRESS DEFLATE (RFC 4978): intercept negotiation, wrap both sides with `compress/flate`, continue ACL evaluation on decompressed stream (deferred to v0.5+)
 
 ---
 

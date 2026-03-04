@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type upstreamTLSMode int
@@ -122,13 +124,251 @@ func (c *config) buildUpstreamTLSConfig() (*tls.Config, error) {
 	return tlsCfg, nil
 }
 
-var protectedKeywords = []string{"trash", "drafts", "junk"}
-
 var reCapStrip = regexp.MustCompile(`(?i)\s+(STARTTLS|LOGINDISABLED)`)
 
 type connState struct {
 	selectedMailbox string
-	isProtected     bool
+}
+
+// ── ACL types ──
+
+type denyEntry struct {
+	command   string // EXPUNGE, CLOSE, DELETE, RENAME, MOVE, STORE, COMPRESS
+	storeOp   string // "+" (add/replace) or "-" (remove); empty for non-STORE
+	storeFlag string // e.g. `\DELETED`; empty if not flag-specific
+}
+
+type rule struct {
+	mailbox string // glob pattern (case-insensitive matching)
+	deny    []denyEntry
+}
+
+type yamlConfig struct {
+	Rules []yamlRule `yaml:"rules"`
+}
+
+type yamlRule struct {
+	Mailbox string   `yaml:"mailbox"`
+	Deny    []string `yaml:"deny"`
+}
+
+// ── Glob matcher ──
+
+// globMatch matches pattern against name, case-insensitively.
+// * matches any sequence of characters (including / and .).
+// ? matches exactly one character.
+func globMatch(pattern, name string) bool {
+	return matchGlob(strings.ToLower(pattern), strings.ToLower(name))
+}
+
+func matchGlob(pattern, name string) bool {
+	for len(pattern) > 0 {
+		switch pattern[0] {
+		case '*':
+			// Consume consecutive *s
+			for len(pattern) > 0 && pattern[0] == '*' {
+				pattern = pattern[1:]
+			}
+			if len(pattern) == 0 {
+				return true // trailing * matches everything
+			}
+			// Try matching the rest of the pattern at each position
+			for i := 0; i <= len(name); i++ {
+				if matchGlob(pattern, name[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if len(name) == 0 {
+				return false
+			}
+			pattern = pattern[1:]
+			name = name[1:]
+		default:
+			if len(name) == 0 || pattern[0] != name[0] {
+				return false
+			}
+			pattern = pattern[1:]
+			name = name[1:]
+		}
+	}
+	return len(name) == 0
+}
+
+// ── Config parsing ──
+
+func loadACLConfig(path string) ([]rule, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read ACL config %q: %w", path, err)
+	}
+
+	var yc yamlConfig
+	if err := yaml.Unmarshal(data, &yc); err != nil {
+		return nil, fmt.Errorf("parse ACL config %q: %w", path, err)
+	}
+
+	var rules []rule
+	for i, yr := range yc.Rules {
+		if yr.Mailbox == "" {
+			return nil, fmt.Errorf("rule %d: mailbox is required", i)
+		}
+		r := rule{mailbox: yr.Mailbox}
+		for _, d := range yr.Deny {
+			entry, err := parseDenyEntry(d)
+			if err != nil {
+				return nil, fmt.Errorf("rule %d: %w", i, err)
+			}
+			r.deny = append(r.deny, entry)
+		}
+		rules = append(rules, r)
+	}
+
+	return rules, nil
+}
+
+// parseDenyEntry parses a deny string like "EXPUNGE", "STORE", "STORE +\Deleted", "STORE -\Seen".
+func parseDenyEntry(s string) (denyEntry, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return denyEntry{}, fmt.Errorf("empty deny entry")
+	}
+
+	parts := strings.SplitN(s, " ", 2)
+	cmd := strings.ToUpper(parts[0])
+
+	validCommands := map[string]bool{
+		"EXPUNGE": true, "CLOSE": true, "DELETE": true,
+		"RENAME": true, "MOVE": true, "STORE": true, "COMPRESS": true,
+	}
+	if !validCommands[cmd] {
+		return denyEntry{}, fmt.Errorf("invalid deny command %q", cmd)
+	}
+
+	if len(parts) == 1 {
+		return denyEntry{command: cmd}, nil
+	}
+
+	if cmd != "STORE" {
+		return denyEntry{}, fmt.Errorf("arguments only valid for STORE, got %q", cmd)
+	}
+
+	// Parse STORE qualifier: "+\Deleted", "-\Seen", etc.
+	qualifier := strings.TrimSpace(parts[1])
+	if len(qualifier) < 2 {
+		return denyEntry{}, fmt.Errorf("invalid STORE qualifier %q", qualifier)
+	}
+
+	var op string
+	var flag string
+	switch qualifier[0] {
+	case '+':
+		op = "+"
+		flag = strings.ToUpper(qualifier[1:])
+	case '-':
+		op = "-"
+		flag = strings.ToUpper(qualifier[1:])
+	default:
+		return denyEntry{}, fmt.Errorf("STORE qualifier must start with + or -, got %q", qualifier)
+	}
+
+	if flag == "" {
+		return denyEntry{}, fmt.Errorf("STORE qualifier missing flag name")
+	}
+
+	return denyEntry{command: "STORE", storeOp: op, storeFlag: flag}, nil
+}
+
+// ── STORE args parser ──
+
+// parseStoreArgs extracts the operation type and flags from STORE command arguments.
+// Format: sequence-set SP [+/-]FLAGS[.SILENT] SP flag-list
+// Returns op ("+" for +FLAGS/FLAGS, "-" for -FLAGS) and uppercased flags string.
+func parseStoreArgs(args string) (op, flags string) {
+	parts := strings.SplitN(strings.TrimSpace(args), " ", 3)
+	if len(parts) < 3 {
+		return "", ""
+	}
+
+	flagOp := strings.ToUpper(parts[1])
+
+	if strings.HasPrefix(flagOp, "-") {
+		op = "-"
+	} else if strings.HasPrefix(flagOp, "+") {
+		op = "+"
+	} else {
+		// Bare FLAGS or FLAGS.SILENT — equivalent to replacing, treat as "+"
+		op = "+"
+	}
+
+	// Validate it's actually a FLAGS operation
+	base := strings.TrimPrefix(strings.TrimPrefix(flagOp, "+"), "-")
+	if base != "FLAGS" && base != "FLAGS.SILENT" {
+		return "", ""
+	}
+
+	flags = strings.ToUpper(parts[2])
+	return op, flags
+}
+
+// ── Rule evaluation ──
+
+func (r *rule) matches(mailbox, cmd string, storeOp, storeFlags string) (bool, string) {
+	if !globMatch(r.mailbox, mailbox) {
+		return false, ""
+	}
+
+	for _, d := range r.deny {
+		if d.command != cmd {
+			continue
+		}
+
+		if d.command != "STORE" {
+			desc := fmt.Sprintf("mailbox=%q deny=%s", r.mailbox, d.command)
+			return true, desc
+		}
+
+		// STORE with no qualifier: blocks all STORE
+		if d.storeOp == "" && d.storeFlag == "" {
+			desc := fmt.Sprintf("mailbox=%q deny=STORE", r.mailbox)
+			return true, desc
+		}
+
+		// Check STORE op and flag
+		if d.storeOp == "+" && (storeOp == "+" || storeOp == "") {
+			// Rule blocks +flag: matches +FLAGS and bare FLAGS (which replaces)
+			// But storeOp from parseStoreArgs returns "+" for both
+			if storeOp == "+" && strings.Contains(storeFlags, d.storeFlag) {
+				desc := fmt.Sprintf("mailbox=%q deny=STORE %s%s", r.mailbox, d.storeOp, d.storeFlag)
+				return true, desc
+			}
+		}
+		if d.storeOp == "-" && storeOp == "-" && strings.Contains(storeFlags, d.storeFlag) {
+			desc := fmt.Sprintf("mailbox=%q deny=STORE %s%s", r.mailbox, d.storeOp, d.storeFlag)
+			return true, desc
+		}
+	}
+
+	return false, ""
+}
+
+func evalACL(rules []rule, mailbox, cmd string, storeOp, storeFlags string) (bool, string) {
+	if len(rules) == 0 {
+		return false, ""
+	}
+
+	for i := range rules {
+		if blocked, desc := rules[i].matches(mailbox, cmd, storeOp, storeFlags); blocked {
+			return true, fmt.Sprintf("rule[%d]: %s", i, desc)
+		}
+	}
+
+	return false, ""
 }
 
 func main() {
@@ -137,9 +377,19 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
+	rules, err := loadACLConfig(os.Getenv("IMAP_GUARD_CONFIG"))
+	if err != nil {
+		log.Fatalf("ACL config error: %v", err)
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("imap-guard starting: listen=%s upstream=%s tls=%s",
 		cfg.listenAddr, cfg.upstreamAddr, []string{"plaintext", "starttls", "tls"}[cfg.upstreamTLS])
+	if rules == nil {
+		log.Printf("no ACL config: operating as pure pass-through proxy")
+	} else {
+		log.Printf("ACL config loaded: %d rules", len(rules))
+	}
 
 	var ln net.Listener
 	if cfg.clientTLSEnabled() {
@@ -170,7 +420,7 @@ func main() {
 		}
 		connID := fmt.Sprintf("C%d", atomic.AddUint64(&connCounter, 1))
 		log.Printf("ACCEPT %s from %s", connID, conn.RemoteAddr())
-		go handleClient(conn, cfg, connID)
+		go handleClient(conn, cfg, rules, connID)
 	}
 }
 
@@ -181,7 +431,7 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func handleClient(clientConn net.Conn, cfg *config, connID string) {
+func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string) {
 	defer clientConn.Close()
 
 	upstreamConn, greeting, err := connectToUpstream(cfg)
@@ -213,7 +463,7 @@ func handleClient(clientConn net.Conn, cfg *config, connID string) {
 	}()
 
 	go func() {
-		relayClientToServer(clientReader, upstreamConn, clientConn, state, connID)
+		relayClientToServer(clientReader, upstreamConn, clientConn, state, rules, connID)
 		done <- struct{}{}
 	}()
 
@@ -316,7 +566,7 @@ func connectUpstreamTLS(cfg *config) (net.Conn, string, error) {
 	return conn, greeting, nil
 }
 
-func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, state *connState, connID string) {
+func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, state *connState, rules []rule, connID string) {
 	for {
 		line, err := client.ReadString('\n')
 		if err != nil {
@@ -345,23 +595,21 @@ func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, st
 					}
 					mailbox = strings.TrimRight(string(litBuf), "\r\n")
 					state.selectedMailbox = mailbox
-					state.isProtected = isProtected(mailbox)
-					continue
+						continue
 				}
 			}
 			if mailbox != "" {
 				state.selectedMailbox = mailbox
-				state.isProtected = isProtected(mailbox)
 			}
 		}
 
-		// Block forbidden operations on protected mailboxes
-		if shouldBlock(cmd, args, state) {
-			resp := fmt.Sprintf("%s NO [NOPERM] Operation blocked on protected mailbox\r\n", tag)
+		// Block forbidden operations per ACL rules
+		if blocked, ruleDesc := shouldBlock(cmd, args, state, rules); blocked {
+			resp := fmt.Sprintf("%s NO [NOPERM] Operation blocked by ACL rule\r\n", tag)
 			if _, err := clientConn.Write([]byte(resp)); err != nil {
 				return
 			}
-			log.Printf("BLOCKED %s: %s %s %s (mailbox=%s)", connID, tag, cmd, args, state.selectedMailbox)
+			log.Printf("BLOCKED %s: %s %s %s (mailbox=%s, %s)", connID, tag, cmd, args, state.selectedMailbox, ruleDesc)
 			continue
 		}
 
@@ -448,84 +696,55 @@ func extractMailbox(args string) string {
 	return args
 }
 
-func isProtected(mailbox string) bool {
-	lower := strings.ToLower(mailbox)
-	for _, keyword := range protectedKeywords {
-		if strings.Contains(lower, keyword) {
-			return true
-		}
+func shouldBlock(cmd, args string, state *connState, rules []rule) (bool, string) {
+	if len(rules) == 0 {
+		return false, ""
 	}
-	return false
-}
 
-func shouldBlock(cmd, args string, state *connState) bool {
 	// DELETE and RENAME target a named mailbox, not the selected one
 	switch cmd {
 	case "DELETE":
 		mailbox := extractMailbox(args)
-		return mailbox != "" && isProtected(mailbox)
+		if mailbox == "" {
+			return false, ""
+		}
+		return evalACL(rules, mailbox, "DELETE", "", "")
 	case "RENAME":
 		mailbox := extractMailbox(args)
-		return mailbox != "" && isProtected(mailbox)
-	case "COMPRESS":
-		// COMPRESS would make traffic opaque, bypassing ACL enforcement
-		return state.isProtected
+		if mailbox == "" {
+			return false, ""
+		}
+		return evalACL(rules, mailbox, "RENAME", "", "")
 	}
 
-	if !state.isProtected {
-		return false
+	mailbox := state.selectedMailbox
+	if mailbox == "" {
+		return false, ""
 	}
 
 	switch cmd {
-	case "EXPUNGE", "CLOSE", "MOVE":
-		return true
+	case "EXPUNGE", "CLOSE", "MOVE", "COMPRESS":
+		return evalACL(rules, mailbox, cmd, "", "")
 	case "STORE":
-		return storeAddsDeleted(args)
+		op, flags := parseStoreArgs(args)
+		return evalACL(rules, mailbox, "STORE", op, flags)
 	case "UID":
 		subParts := strings.SplitN(args, " ", 2)
 		if len(subParts) == 0 {
-			return false
+			return false, ""
 		}
 		subCmd := strings.ToUpper(subParts[0])
 		switch subCmd {
 		case "EXPUNGE", "MOVE":
-			return true
+			return evalACL(rules, mailbox, subCmd, "", "")
 		case "STORE":
 			if len(subParts) > 1 {
-				return storeAddsDeleted(subParts[1])
+				op, flags := parseStoreArgs(subParts[1])
+				return evalACL(rules, mailbox, "STORE", op, flags)
 			}
 		}
 	}
-	return false
-}
-
-// storeAddsDeleted checks if STORE args would add the \Deleted flag.
-// Format: sequence-set SP [+/-]FLAGS[.SILENT] SP flag-list
-func storeAddsDeleted(args string) bool {
-	upper := strings.ToUpper(args)
-	if !strings.Contains(upper, `\DELETED`) {
-		return false
-	}
-
-	parts := strings.SplitN(strings.TrimSpace(args), " ", 3)
-	if len(parts) < 3 {
-		return false
-	}
-
-	flagOp := strings.ToUpper(parts[1])
-
-	// -FLAGS removes flags — allow it
-	if strings.HasPrefix(flagOp, "-") {
-		return false
-	}
-
-	// +FLAGS, +FLAGS.SILENT, FLAGS, FLAGS.SILENT with \Deleted → block
-	if flagOp == "FLAGS" || flagOp == "FLAGS.SILENT" ||
-		flagOp == "+FLAGS" || flagOp == "+FLAGS.SILENT" {
-		return strings.Contains(strings.ToUpper(parts[2]), `\DELETED`)
-	}
-
-	return false
+	return false, ""
 }
 
 // stripCaps removes STARTTLS and LOGINDISABLED from IMAP capability lines.
