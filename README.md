@@ -18,7 +18,7 @@ go build -o imap-guard .
 
 ## Configuration
 
-All configuration is via environment variables.
+All configuration is via environment variables. Run `imap-guard --help` for a summary.
 
 | Environment Variable | Default | Description |
 |---|---|---|
@@ -29,6 +29,12 @@ All configuration is via environment variables.
 | `IMAP_GUARD_CLIENT_TLS_CERT` | (empty) | Path to PEM certificate for client-facing TLS |
 | `IMAP_GUARD_CLIENT_TLS_KEY` | (empty) | Path to PEM private key for client-facing TLS |
 | `IMAP_GUARD_CONFIG` | (empty) | Path to YAML ACL config file |
+| `IMAP_GUARD_LOG_FORMAT` | `text` | Log format: `text` or `json` |
+| `IMAP_GUARD_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `IMAP_GUARD_SHUTDOWN_TIMEOUT` | `30s` | Max time to drain active connections on shutdown |
+| `IMAP_GUARD_HEALTH_LISTEN` | (empty) | HTTP health/metrics listen address (e.g., `:8080`), empty to disable |
+| `IMAP_GUARD_IDLE_TIMEOUT` | `30m` | Close connection after this duration of inactivity |
+| `IMAP_GUARD_SESSION_TIMEOUT` | `24h` | Max total connection duration |
 
 ### ACL configuration
 
@@ -61,7 +67,7 @@ Rules are evaluated in order — the first rule whose mailbox pattern matches is
 | `DELETE` | Block DELETE (destroys mailbox) |
 | `RENAME` | Block RENAME (moves mailbox out of scope) |
 | `MOVE` | Block MOVE and UID MOVE |
-| `COMPRESS` | Block COMPRESS DEFLATE |
+| `COMPRESS` | Block COMPRESS DEFLATE negotiation |
 | `STORE` | Block all STORE and UID STORE commands |
 | `"STORE +\\Deleted"` | Block STORE/UID STORE when adding `\Deleted` flag (+FLAGS or FLAGS) |
 | `"STORE -\\Seen"` | Block STORE/UID STORE when removing `\Seen` flag (-FLAGS) |
@@ -101,20 +107,64 @@ Mailbox patterns support `*` (matches any characters, including hierarchy separa
 | `INBOX.*` | `INBOX.Sent`, `INBOX.Drafts` |
 | `*` | All mailboxes |
 
-### Migrating from v0.4
+### COMPRESS DEFLATE
 
-v0.5 adds `deny-unless-copied` as a new ACL action. Existing configs with only `deny` rules continue to work unchanged. To use conditional EXPUNGE protection, move `EXPUNGE` from `deny` to `deny-unless-copied`. Note: a command cannot appear in both `deny` and `deny-unless-copied` within the same rule — the config loader will reject the overlap at startup.
+imap-guard supports COMPRESS DEFLATE (RFC 4978). When a client negotiates COMPRESS DEFLATE with the upstream server, the proxy intercepts the negotiation and wraps both connections with raw DEFLATE streams. ACL evaluation continues to operate on the decompressed command stream.
+
+To block COMPRESS negotiation on specific mailboxes, add `COMPRESS` to the deny list:
 
 ```yaml
-# Before (v0.4): EXPUNGE unconditionally blocked
-- mailbox: "*trash*"
-  deny: [EXPUNGE, CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
-
-# After (v0.5): EXPUNGE allowed after COPY
-- mailbox: "*trash*"
-  deny: [CLOSE, DELETE, RENAME, MOVE, COMPRESS, "STORE +\\Deleted"]
-  deny-unless-copied: [EXPUNGE]
+rules:
+  - mailbox: "*trash*"
+    deny: [COMPRESS]
 ```
+
+If COMPRESS is not in the deny list, the proxy transparently relays the COMPRESS negotiation and switches to compressed streams when the upstream server accepts.
+
+### Connection timeouts
+
+The proxy enforces two timeout types:
+
+- **Idle timeout** (`IMAP_GUARD_IDLE_TIMEOUT`, default 30m): Closes connections with no read activity. The 30-minute default aligns with RFC 2177's recommendation for IMAP IDLE re-issue intervals.
+- **Session timeout** (`IMAP_GUARD_SESSION_TIMEOUT`, default 24h): Maximum total connection duration regardless of activity.
+
+Both timeouts apply to the client-facing and upstream connections.
+
+### Graceful shutdown
+
+On SIGINT or SIGTERM, the proxy stops accepting new connections and waits up to `IMAP_GUARD_SHUTDOWN_TIMEOUT` (default 30s) for active connections to complete. If connections don't drain within the timeout, the process exits.
+
+### Health check and metrics
+
+Set `IMAP_GUARD_HEALTH_LISTEN` to enable an HTTP health/metrics endpoint:
+
+```sh
+IMAP_GUARD_HEALTH_LISTEN=:8080 imap-guard
+```
+
+- `GET /healthz` — Returns `200 OK` with body `ok`
+- `GET /metrics` — Returns JSON:
+  ```json
+  {"active_connections": 5, "total_commands_proxied": 1234, "total_commands_blocked": 12}
+  ```
+
+### Logging
+
+Structured logging via Go's `log/slog`. Configure format and level:
+
+```sh
+IMAP_GUARD_LOG_FORMAT=json IMAP_GUARD_LOG_LEVEL=debug imap-guard
+```
+
+Log levels:
+- `debug` — Per-command relay logging (every IMAP command)
+- `info` — Connection accept/close, blocked commands, startup messages
+- `warn` — Shutdown timeout warnings
+- `error` — Connection failures, upstream errors
+
+### Migrating from v0.5
+
+v1.0 adds structured logging, connection timeouts, COMPRESS DEFLATE support, health endpoints, and graceful shutdown. Existing ACL configs work unchanged. New environment variables are all optional with sensible defaults.
 
 ## Usage
 
@@ -183,24 +233,21 @@ Environment=IMAP_GUARD_LISTEN=:1143
 Environment=IMAP_GUARD_UPSTREAM=imap.gmail.com:993
 Environment=IMAP_GUARD_UPSTREAM_TLS=tls
 Environment=IMAP_GUARD_CONFIG=/etc/imap-guard/rules.yaml
+Environment=IMAP_GUARD_HEALTH_LISTEN=:8080
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Docker (alongside Proton Bridge)
+### Docker
 
-```dockerfile
-FROM golang:1.22 AS build
-RUN go install github.com/emersonmde/imap-guard@latest
-
-FROM debian:bookworm-slim
-COPY --from=build /go/bin/imap-guard /usr/local/bin/
-ENV IMAP_GUARD_LISTEN=:1144
-ENV IMAP_GUARD_UPSTREAM=127.0.0.1:1143
-ENTRYPOINT ["imap-guard"]
+```sh
+docker build -t imap-guard .
+docker run -e IMAP_GUARD_UPSTREAM=imap.gmail.com:993 -e IMAP_GUARD_UPSTREAM_TLS=tls -p 1143:1143 imap-guard
 ```
+
+A `docker-compose.yaml` is included with an example Proton Bridge setup.
 
 ## Testing
 

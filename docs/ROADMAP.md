@@ -1,6 +1,6 @@
 # imap-guard Development Roadmap
 
-Current version: **v0.5**
+Current version: **v1.0**
 
 ## Design Principles
 
@@ -52,9 +52,9 @@ Fix correctness issues found in code review.
 - [x] Handle literal mailbox names in SELECT/EXAMINE, or conservatively block literal-form SELECT on protected mailboxes
 - [x] Check error return from `clientConn.Write` when sending blocked responses
 - [x] Change default listen port from `:144` to `:1143` or another non-privileged port — *done in v0.3*
-- [ ] Fix test goroutine lifecycle: don't call `t.Errorf` from background goroutines, add `sync.WaitGroup` to track proxy goroutines
+- [x] Fix test goroutine lifecycle: don't call `t.Errorf` from background goroutines, add `sync.WaitGroup` to track proxy goroutines
 - [x] Fix `generateTestCert` to propagate errors via `testing.T`
-- [ ] Replace racy `time.Sleep` in tests with deterministic synchronization
+- [x] Replace racy `time.Sleep` in tests with deterministic synchronization
 
 ---
 
@@ -181,16 +181,16 @@ The v0.4 approach blocks all EXPUNGE in protected mailboxes. But some workflows 
 
 Polish, observability, and operational readiness.
 
-- [ ] Structured logging (JSON option for log aggregation)
-- [ ] Log levels (debug for per-command relay, info for connections/blocks, error for failures)
-- [ ] Graceful shutdown on SIGTERM/SIGINT (drain active connections)
-- [ ] Health check endpoint (HTTP) for container orchestration
-- [ ] Connection timeout configuration (idle timeout, total session timeout)
-- [ ] Metrics: active connections, commands proxied, commands blocked (Prometheus endpoint or structured log counters)
-- [ ] Docker image and example docker-compose setup
-- [ ] man page or `--help` with full option documentation
-- [ ] Support COMPRESS DEFLATE (RFC 4978): intercept negotiation, wrap both sides with `compress/flate`, continue ACL evaluation on decompressed stream
-- [ ] CI pipeline (lint, test, build, release binaries)
+- [x] Structured logging (JSON option for log aggregation)
+- [x] Log levels (debug for per-command relay, info for connections/blocks, error for failures)
+- [x] Graceful shutdown on SIGTERM/SIGINT (drain active connections)
+- [x] Health check endpoint (HTTP) for container orchestration
+- [x] Connection timeout configuration (idle timeout, total session timeout)
+- [x] Metrics: active connections, commands proxied, commands blocked (JSON on health endpoint)
+- [x] Docker image and example docker-compose setup
+- [x] `--help` with full option documentation
+- [x] Support COMPRESS DEFLATE (RFC 4978): intercept negotiation, wrap both sides with `compress/flate`, continue ACL evaluation on decompressed stream
+- [x] CI pipeline (lint, test, build)
 
 ---
 

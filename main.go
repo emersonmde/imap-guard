@@ -2,18 +2,25 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/flate"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -28,12 +35,18 @@ const (
 )
 
 type config struct {
-	listenAddr     string
-	upstreamAddr   string
-	upstreamTLS    upstreamTLSMode
-	upstreamVerify string // "verify", "skip", or CA file path
-	clientTLSCert  string
-	clientTLSKey   string
+	listenAddr      string
+	upstreamAddr    string
+	upstreamTLS     upstreamTLSMode
+	upstreamVerify  string // "verify", "skip", or CA file path
+	clientTLSCert   string
+	clientTLSKey    string
+	logFormat       string
+	logLevel        slog.Level
+	shutdownTimeout time.Duration
+	healthListen    string
+	idleTimeout     time.Duration
+	sessionTimeout  time.Duration
 }
 
 func parseConfig() (*config, error) {
@@ -43,6 +56,31 @@ func parseConfig() (*config, error) {
 		upstreamVerify: envOrDefault("IMAP_GUARD_UPSTREAM_VERIFY", "verify"),
 		clientTLSCert:  os.Getenv("IMAP_GUARD_CLIENT_TLS_CERT"),
 		clientTLSKey:   os.Getenv("IMAP_GUARD_CLIENT_TLS_KEY"),
+		logFormat:      strings.ToLower(envOrDefault("IMAP_GUARD_LOG_FORMAT", "text")),
+		healthListen:   os.Getenv("IMAP_GUARD_HEALTH_LISTEN"),
+	}
+
+	level, err := parseLogLevel(envOrDefault("IMAP_GUARD_LOG_LEVEL", "info"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.logLevel = level
+
+	cfg.shutdownTimeout, err = parseDuration("IMAP_GUARD_SHUTDOWN_TIMEOUT", "30s")
+	if err != nil {
+		return nil, err
+	}
+	cfg.idleTimeout, err = parseDuration("IMAP_GUARD_IDLE_TIMEOUT", "30m")
+	if err != nil {
+		return nil, err
+	}
+	cfg.sessionTimeout, err = parseDuration("IMAP_GUARD_SESSION_TIMEOUT", "24h")
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.logFormat != "text" && cfg.logFormat != "json" {
+		return nil, fmt.Errorf("invalid IMAP_GUARD_LOG_FORMAT value %q (must be text or json)", cfg.logFormat)
 	}
 
 	switch strings.ToLower(envOrDefault("IMAP_GUARD_UPSTREAM_TLS", "starttls")) {
@@ -84,6 +122,94 @@ func parseConfig() (*config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("invalid IMAP_GUARD_LOG_LEVEL value %q (must be debug, info, warn, or error)", s)
+	}
+}
+
+func parseDuration(envKey, defaultVal string) (time.Duration, error) {
+	s := envOrDefault(envKey, defaultVal)
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s value %q: %w", envKey, s, err)
+	}
+	return d, nil
+}
+
+func initLogger(format string, level slog.Level) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	if format == "json" {
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	}
+	return slog.New(handler)
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `imap-guard — IMAP proxy with ACL-based command blocking
+
+Environment Variables:
+  IMAP_GUARD_LISTEN            Listen address (default: :1143)
+  IMAP_GUARD_UPSTREAM          Upstream IMAP server (default: 127.0.0.1:143)
+  IMAP_GUARD_UPSTREAM_TLS      Upstream TLS mode: plaintext, starttls, tls (default: starttls)
+  IMAP_GUARD_UPSTREAM_VERIFY   TLS verification: verify, skip, or CA file path (default: verify)
+  IMAP_GUARD_CLIENT_TLS_CERT   Path to PEM certificate for client-facing TLS
+  IMAP_GUARD_CLIENT_TLS_KEY    Path to PEM private key for client-facing TLS
+  IMAP_GUARD_CONFIG            Path to YAML ACL config file
+  IMAP_GUARD_LOG_FORMAT        Log format: text or json (default: text)
+  IMAP_GUARD_LOG_LEVEL         Log level: debug, info, warn, error (default: info)
+  IMAP_GUARD_SHUTDOWN_TIMEOUT  Max time to drain connections on shutdown (default: 30s)
+  IMAP_GUARD_HEALTH_LISTEN     HTTP health/metrics listen address, e.g. :8080 (default: disabled)
+  IMAP_GUARD_IDLE_TIMEOUT      Close connection after inactivity (default: 30m)
+  IMAP_GUARD_SESSION_TIMEOUT   Max total connection duration (default: 24h)
+`)
+}
+
+// ── Metrics ──
+
+type metrics struct {
+	activeConns  atomic.Int64
+	totalProxied atomic.Int64
+	totalBlocked atomic.Int64
+}
+
+// ── Health endpoint ──
+
+func startHealthServer(addr string, m *metrics) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "ok")
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int64{
+			"active_connections":     m.activeConns.Load(),
+			"total_commands_proxied": m.totalProxied.Load(),
+			"total_commands_blocked": m.totalBlocked.Load(),
+		})
+	})
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("health server error", "err", err)
+		}
+	}()
+	return srv
 }
 
 func (c *config) clientTLSEnabled() bool {
@@ -137,12 +263,52 @@ const (
 
 const maxUIDSetExpansion = 10000
 
+// ── COMPRESS DEFLATE types ──
+
+type compressDone struct {
+	ok           bool
+	clientWriter *syncWriter // shared compressed writer for client
+	upstreamConn net.Conn   // raw upstream conn for wrapping reader
+}
+
+// syncWriter wraps an io.Writer with a mutex for concurrent write safety.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (sw *syncWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
+type flushWriter struct {
+	w *flate.Writer
+}
+
+func (fw *flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if err := fw.w.Flush(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 type connState struct {
 	selectedMailbox string
 
 	mu            sync.Mutex
 	pendingCopies map[string]bool  // tags of in-flight COPY/MOVE commands
 	copiedUIDs    map[uint32]bool  // source UIDs confirmed copied (from COPYUID)
+
+	// COMPRESS DEFLATE coordination
+	compressTag    atomic.Value     // stores string tag when COMPRESS is in-flight
+	compressRespCh chan string       // server response line (server→client sends back to client→server)
+	compressDoneCh chan compressDone // completion signal with new streams
 }
 
 func (s *connState) recordPendingCopy(tag string) {
@@ -466,56 +632,133 @@ func evalACL(rules []rule, mailbox, cmd string, storeOp, storeFlags string) (acl
 }
 
 func main() {
+	// Check for --help before anything else
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-h", "--help", "help":
+			printUsage()
+			os.Exit(0)
+		}
+	}
+
 	cfg, err := parseConfig()
 	if err != nil {
-		log.Fatalf("config error: %v", err)
+		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
+		os.Exit(1)
 	}
+
+	logger := initLogger(cfg.logFormat, cfg.logLevel)
+	slog.SetDefault(logger)
 
 	rules, err := loadACLConfig(os.Getenv("IMAP_GUARD_CONFIG"))
 	if err != nil {
-		log.Fatalf("ACL config error: %v", err)
+		slog.Error("ACL config error", "err", err)
+		os.Exit(1)
 	}
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("imap-guard starting: listen=%s upstream=%s tls=%s",
-		cfg.listenAddr, cfg.upstreamAddr, []string{"plaintext", "starttls", "tls"}[cfg.upstreamTLS])
+	slog.Info("imap-guard starting",
+		"listen", cfg.listenAddr,
+		"upstream", cfg.upstreamAddr,
+		"tls", []string{"plaintext", "starttls", "tls"}[cfg.upstreamTLS])
 	if rules == nil {
-		log.Printf("no ACL config: operating as pure pass-through proxy")
+		slog.Info("no ACL config: operating as pure pass-through proxy")
 	} else {
-		log.Printf("ACL config loaded: %d rules", len(rules))
+		slog.Info("ACL config loaded", "rules", len(rules))
 	}
 
 	var ln net.Listener
 	if cfg.clientTLSEnabled() {
 		cert, err := tls.LoadX509KeyPair(cfg.clientTLSCert, cfg.clientTLSKey)
 		if err != nil {
-			log.Fatalf("load client TLS cert/key: %v", err)
+			slog.Error("load client TLS cert/key", "err", err)
+			os.Exit(1)
 		}
 		ln, err = tls.Listen("tcp", cfg.listenAddr, &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		})
 		if err != nil {
-			log.Fatalf("failed to listen (TLS) on %s: %v", cfg.listenAddr, err)
+			slog.Error("failed to listen (TLS)", "addr", cfg.listenAddr, "err", err)
+			os.Exit(1)
 		}
-		log.Printf("client-side TLS enabled")
+		slog.Info("client-side TLS enabled")
 	} else {
 		ln, err = net.Listen("tcp", cfg.listenAddr)
 		if err != nil {
-			log.Fatalf("failed to listen on %s: %v", cfg.listenAddr, err)
+			slog.Error("failed to listen", "addr", cfg.listenAddr, "err", err)
+			os.Exit(1)
 		}
 	}
 
+	m := &metrics{}
+
+	// Start health server if configured
+	var healthSrv *http.Server
+	if cfg.healthListen != "" {
+		healthSrv = startHealthServer(cfg.healthListen, m)
+		slog.Info("health endpoint enabled", "addr", cfg.healthListen)
+	}
+
+	// Graceful shutdown setup
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var wg sync.WaitGroup
 	var connCounter uint64
+
+	// Close listener on shutdown signal
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	// Accept loop
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept error: %v", err)
+			if ctx.Err() != nil {
+				break // shutdown requested
+			}
+			slog.Error("accept error", "err", err)
 			continue
 		}
 		connID := fmt.Sprintf("C%d", atomic.AddUint64(&connCounter, 1))
-		log.Printf("ACCEPT %s from %s", connID, conn.RemoteAddr())
-		go handleClient(conn, cfg, rules, connID)
+		slog.Info("connection accepted", "conn", connID, "remote", conn.RemoteAddr())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handleClient(conn, cfg, rules, connID, m)
+		}()
 	}
+
+	// Drain active connections
+	slog.Info("shutting down, draining active connections",
+		"timeout", cfg.shutdownTimeout,
+		"active", m.activeConns.Load())
+
+	drainDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(drainDone)
+	}()
+
+	select {
+	case <-drainDone:
+		slog.Info("all connections drained")
+	case <-time.After(cfg.shutdownTimeout):
+		slog.Warn("shutdown timeout reached, forcing exit",
+			"active", m.activeConns.Load())
+	}
+
+	// Shutdown health server
+	if healthSrv != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		healthSrv.Shutdown(shutdownCtx)
+	}
+
+	slog.Info("imap-guard stopped",
+		"total_proxied", m.totalProxied.Load(),
+		"total_blocked", m.totalBlocked.Load())
 }
 
 func envOrDefault(key, def string) string {
@@ -525,12 +768,14 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string) {
+func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string, m *metrics) {
+	m.activeConns.Add(1)
+	defer m.activeConns.Add(-1)
 	defer clientConn.Close()
 
 	upstreamConn, greeting, err := connectToUpstream(cfg)
 	if err != nil {
-		log.Printf("ERROR %s: upstream connect: %v", connID, err)
+		slog.Error("upstream connect failed", "conn", connID, "err", err)
 		return
 	}
 	defer upstreamConn.Close()
@@ -540,11 +785,18 @@ func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string)
 		greeting = stripCaps(greeting)
 	}
 	if _, err := clientConn.Write([]byte(greeting)); err != nil {
-		log.Printf("ERROR %s: send greeting: %v", connID, err)
+		slog.Error("send greeting failed", "conn", connID, "err", err)
 		return
 	}
 
-	state := &connState{}
+	sessionDeadline := time.Now().Add(cfg.sessionTimeout)
+	clientConn.SetDeadline(sessionDeadline)
+	upstreamConn.SetDeadline(sessionDeadline)
+
+	state := &connState{
+		compressRespCh: make(chan string, 1),
+		compressDoneCh: make(chan compressDone, 1),
+	}
 	clientReader := bufio.NewReaderSize(clientConn, 8192)
 	upstreamReader := bufio.NewReaderSize(upstreamConn, 8192)
 	stripCapsRelay := cfg.shouldStripCaps()
@@ -552,12 +804,17 @@ func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string)
 	done := make(chan struct{}, 2)
 
 	go func() {
-		relayServerToClient(upstreamReader, clientConn, state, connID, stripCapsRelay)
+		relayServerToClient(upstreamReader, upstreamConn, clientConn, clientConn,
+			state, connID, stripCapsRelay,
+			cfg.idleTimeout, sessionDeadline)
 		done <- struct{}{}
 	}()
 
 	go func() {
-		relayClientToServer(clientReader, upstreamConn, clientConn, state, rules, connID)
+		relayClientToServer(clientReader, clientConn,
+			upstreamConn, upstreamConn,
+			state, rules, connID, m,
+			cfg.idleTimeout, sessionDeadline)
 		done <- struct{}{}
 	}()
 
@@ -566,7 +823,7 @@ func handleClient(clientConn net.Conn, cfg *config, rules []rule, connID string)
 	upstreamConn.Close()
 	<-done
 
-	log.Printf("CLOSED %s", connID)
+	slog.Info("connection closed", "conn", connID)
 }
 
 func connectToUpstream(cfg *config) (net.Conn, string, error) {
@@ -660,14 +917,30 @@ func connectUpstreamTLS(cfg *config) (net.Conn, string, error) {
 	return conn, greeting, nil
 }
 
-func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, state *connState, rules []rule, connID string) {
+func resetDeadline(conn net.Conn, idleTimeout time.Duration, sessionDeadline time.Time) {
+	deadline := time.Now().Add(idleTimeout)
+	if deadline.After(sessionDeadline) {
+		deadline = sessionDeadline
+	}
+	conn.SetReadDeadline(deadline)
+}
+
+func relayClientToServer(clientReader *bufio.Reader, clientConn net.Conn,
+	upstreamWriter io.Writer, upstreamConn net.Conn,
+	state *connState, rules []rule, connID string, m *metrics,
+	idleTimeout time.Duration, sessionDeadline time.Time) {
+
+	var clientWriter io.Writer = clientConn
+
 	for {
-		line, err := client.ReadString('\n')
+		resetDeadline(clientConn, idleTimeout, sessionDeadline)
+		line, err := clientReader.ReadString('\n')
 		if err != nil {
 			return
 		}
 
 		tag, cmd, args := parseCommand(line)
+		slog.Debug("client command", "conn", connID, "tag", tag, "cmd", cmd, "args", args)
 
 		// Track mailbox selection
 		if cmd == "SELECT" || cmd == "EXAMINE" {
@@ -676,21 +949,21 @@ func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, st
 			if mailbox == "" {
 				if n, ok := parseLiteral(line); ok && n > 0 && n <= 1024 {
 					// Forward the command line first
-					if _, err := upstream.Write([]byte(line)); err != nil {
+					if _, err := upstreamWriter.Write([]byte(line)); err != nil {
 						return
 					}
 					// Read the literal mailbox name from client and forward it
 					litBuf := make([]byte, n)
-					if _, err := io.ReadFull(client, litBuf); err != nil {
+					if _, err := io.ReadFull(clientReader, litBuf); err != nil {
 						return
 					}
-					if _, err := upstream.Write(litBuf); err != nil {
+					if _, err := upstreamWriter.Write(litBuf); err != nil {
 						return
 					}
 					mailbox = strings.TrimRight(string(litBuf), "\r\n")
 					state.selectedMailbox = mailbox
 					state.resetCopyState()
-					// Literal path: already forwarded above, skip normal forwarding
+					m.totalProxied.Add(1)
 					continue
 				}
 			}
@@ -716,30 +989,94 @@ func relayClientToServer(client *bufio.Reader, upstream, clientConn net.Conn, st
 		// Block forbidden operations per ACL rules
 		if blocked, ruleDesc := shouldBlock(cmd, args, state, rules); blocked {
 			resp := fmt.Sprintf("%s NO [NOPERM] Operation blocked by ACL rule\r\n", tag)
-			if _, err := clientConn.Write([]byte(resp)); err != nil {
+			if _, err := clientWriter.Write([]byte(resp)); err != nil {
 				return
 			}
-			log.Printf("BLOCKED %s: %s %s %s (mailbox=%s, %s)", connID, tag, cmd, args, state.selectedMailbox, ruleDesc)
+			m.totalBlocked.Add(1)
+			slog.Info("command blocked", "conn", connID, "tag", tag, "cmd", cmd,
+				"args", args, "mailbox", state.selectedMailbox, "rule", ruleDesc)
+			continue
+		}
+
+		// Handle COMPRESS DEFLATE negotiation
+		if cmd == "COMPRESS" && strings.ToUpper(strings.TrimSpace(args)) == "DEFLATE" {
+			// Signal server→client relay to intercept the response for this tag
+			state.compressTag.Store(tag)
+
+			// Forward to upstream
+			if _, err := upstreamWriter.Write([]byte(line)); err != nil {
+				return
+			}
+			m.totalProxied.Add(1)
+
+			// Wait for the server response line (sent by server→client relay)
+			respLine := <-state.compressRespCh
+
+			_, rest := parseTaggedResponse(respLine)
+			upper := strings.ToUpper(rest)
+
+			if !strings.HasPrefix(upper, "OK") {
+				// Server rejected COMPRESS — send response to client, continue uncompressed
+				if _, err := clientWriter.Write([]byte(respLine)); err != nil {
+					return
+				}
+				slog.Info("COMPRESS DEFLATE rejected by upstream", "conn", connID)
+				continue
+			}
+
+			// Server accepted COMPRESS — set up deflate streams
+			slog.Info("COMPRESS DEFLATE accepted", "conn", connID)
+
+			// Send the OK response to client (uncompressed — client expects this before switching)
+			if _, err := clientWriter.Write([]byte(respLine)); err != nil {
+				return
+			}
+
+			// Wrap upstream writer with flate
+			upstreamFlate, _ := flate.NewWriter(upstreamConn, flate.DefaultCompression)
+			upstreamFW := &flushWriter{w: upstreamFlate}
+
+			// Create a single shared compressed writer for client (used by both goroutines)
+			clientFlate, _ := flate.NewWriter(clientConn, flate.DefaultCompression)
+			clientFW := &syncWriter{w: &flushWriter{w: clientFlate}}
+
+			// Signal server→client relay with new writers
+			state.compressDoneCh <- compressDone{
+				ok:           true,
+				clientWriter: clientFW,
+				upstreamConn: upstreamConn,
+			}
+
+			// Swap our own streams
+			upstreamWriter = upstreamFW
+			clientWriter = clientFW
+			clientReader = bufio.NewReaderSize(flate.NewReader(clientConn), 8192)
 			continue
 		}
 
 		// Forward to upstream
-		if _, err := upstream.Write([]byte(line)); err != nil {
+		if _, err := upstreamWriter.Write([]byte(line)); err != nil {
 			return
 		}
+		m.totalProxied.Add(1)
 
 		// Pass through any literal data
 		if n, ok := parseLiteral(line); ok {
-			if _, err := io.CopyN(upstream, client, n); err != nil {
+			if _, err := io.CopyN(upstreamWriter, clientReader, n); err != nil {
 				return
 			}
 		}
 	}
 }
 
-func relayServerToClient(upstream *bufio.Reader, clientConn net.Conn, state *connState, connID string, stripCapabilities bool) {
+func relayServerToClient(upstreamReader *bufio.Reader, upstreamConn net.Conn,
+	clientWriter io.Writer, clientConn net.Conn,
+	state *connState, connID string, stripCapabilities bool,
+	idleTimeout time.Duration, sessionDeadline time.Time) {
+
 	for {
-		line, err := upstream.ReadString('\n')
+		resetDeadline(upstreamConn, idleTimeout, sessionDeadline)
+		line, err := upstreamReader.ReadString('\n')
 		if err != nil {
 			return
 		}
@@ -748,27 +1085,63 @@ func relayServerToClient(upstream *bufio.Reader, clientConn net.Conn, state *con
 			line = stripCaps(line)
 		}
 
-		// Track COPYUID responses for deny-unless-copied
+		// Check if this is a response to a COMPRESS DEFLATE command
 		if tag, rest := parseTaggedResponse(line); tag != "" {
+			if compTag, ok := state.compressTag.Load().(string); ok && compTag == tag {
+				// Clear the compress tag
+				state.compressTag.Store("")
+
+				// Send the response line to client→server relay
+				state.compressRespCh <- line
+
+				upper := strings.ToUpper(rest)
+				if !strings.HasPrefix(upper, "OK") {
+					// Rejected — continue as normal
+					continue
+				}
+
+				// Wait for client→server relay to set up streams and signal us
+				done := <-state.compressDoneCh
+				if !done.ok {
+					continue
+				}
+
+				// Drain any buffered data from old reader
+				buffered := upstreamReader.Buffered()
+				var newUpstreamReader io.Reader
+				if buffered > 0 {
+					buf, _ := upstreamReader.Peek(buffered)
+					bufCopy := make([]byte, len(buf))
+					copy(bufCopy, buf)
+					newUpstreamReader = io.MultiReader(bytes.NewReader(bufCopy), upstreamConn)
+				} else {
+					newUpstreamReader = upstreamConn
+				}
+
+				// Wrap upstream reader with flate decompression
+				upstreamReader = bufio.NewReaderSize(flate.NewReader(newUpstreamReader), 8192)
+				clientWriter = done.clientWriter
+				continue
+			}
+
+			// Track COPYUID responses for deny-unless-copied
 			if state.resolvePendingCopy(tag) {
-				// This is a response to a COPY/MOVE command we tracked
 				upper := strings.ToUpper(rest)
 				if strings.HasPrefix(upper, "OK") {
 					if uids, ok := parseCOPYUID(line); ok {
 						state.recordCopiedUIDs(uids)
 					}
 				}
-				// NO/BAD: copy failed, no UIDs recorded
 			}
 		}
 
-		if _, err := clientConn.Write([]byte(line)); err != nil {
+		if _, err := clientWriter.Write([]byte(line)); err != nil {
 			return
 		}
 
 		// Pass through any literal data
 		if n, ok := parseLiteral(line); ok {
-			if _, err := io.CopyN(clientConn, upstream, n); err != nil {
+			if _, err := io.CopyN(clientWriter, upstreamReader, n); err != nil {
 				return
 			}
 		}
