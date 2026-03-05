@@ -9,7 +9,7 @@ import (
 
 func TestParseCommand(t *testing.T) {
 	tests := []struct {
-		line            string
+		line                       string
 		wantTag, wantCmd, wantArgs string
 	}{
 		{"a1 SELECT Trash\r\n", "a1", "SELECT", "Trash"},
@@ -102,7 +102,7 @@ func TestStripCaps(t *testing.T) {
 
 func TestParseLiteral(t *testing.T) {
 	tests := []struct {
-		line string
+		line   string
 		wantN  int64
 		wantOK bool
 	}{
@@ -175,9 +175,9 @@ func TestQuoteMailbox(t *testing.T) {
 
 func TestParseUIDSet(t *testing.T) {
 	tests := []struct {
-		input   string
+		input    string
 		wantUIDs []uint32
-		wantOK  bool
+		wantOK   bool
 	}{
 		{"1", []uint32{1}, true},
 		{"100", []uint32{100}, true},
@@ -245,8 +245,8 @@ func TestParseCOPYUID(t *testing.T) {
 
 func TestParseTaggedResponse(t *testing.T) {
 	tests := []struct {
-		line    string
-		wantTag string
+		line     string
+		wantTag  string
 		wantRest string
 	}{
 		{"a1 OK done\r\n", "a1", "OK done"},

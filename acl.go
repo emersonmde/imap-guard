@@ -11,7 +11,7 @@ import (
 type aclResult int
 
 const (
-	aclAllow           aclResult = iota
+	aclAllow aclResult = iota
 	aclDeny
 	aclDenyUnlessCopied
 )

@@ -85,9 +85,9 @@ func TestParseDenyEntry(t *testing.T) {
 		// Invalid
 		{"", denyEntry{}, true},
 		{"BADCMD", denyEntry{}, true},
-		{"EXPUNGE extra", denyEntry{}, true},     // non-STORE with args
-		{"STORE +", denyEntry{}, true},            // missing flag
-		{"STORE noop", denyEntry{}, true},         // no + or - prefix
+		{"EXPUNGE extra", denyEntry{}, true}, // non-STORE with args
+		{"STORE +", denyEntry{}, true},       // missing flag
+		{"STORE noop", denyEntry{}, true},    // no + or - prefix
 	}
 	for _, tt := range tests {
 		got, err := parseDenyEntry(tt.input)
@@ -282,8 +282,8 @@ rules:
 
 func TestParseStoreArgs(t *testing.T) {
 	tests := []struct {
-		args     string
-		wantOp   string
+		args      string
+		wantOp    string
 		wantFlags string
 	}{
 		// Add flags
